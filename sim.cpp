@@ -10,6 +10,12 @@
 //    exec_mode:cpu | exec_mode:gpu | exec_mode:cpu,gpu  — with cpu,gpu every
 //    task whose precalculated total FLOPs exceed 1 TFLOP (--gpu-threshold)
 //    runs on the GPU, the rest on the CPU
+//  * Capacity-aware packing (exec_mode gpu / cpu,gpu): GPU capacity =
+//    --gpu-mult x calibrated CPU FLOP/s per process; every task gets a
+//    modelled GPU demand (FLOP/s it can usefully consume, from its shape), and
+//    tasks are packed onto separate CUDA streams until the device's capacity
+//    or stream limit is reached. The CPU runs its own task concurrently on a
+//    worker thread, so CPU and GPU are both kept busy.
 //  * Dynamic self-scheduling through a global task counter (NXTVAL) implemented
 //    with MPI-3 passive-target RMA (MPI_Fetch_and_op, MPI_SUM)
 //  * Runtime control (priority / suspend / resume / exit) from a monitor thread
@@ -34,6 +40,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -79,6 +86,21 @@ struct Config {
   double timeline_ms = 250.0;  // timeline sample interval
   double max_seconds = 0.0;    // >0: inject e:1 after this many seconds
   int verbose = 1;
+  // ---- capacity model / packing (exec_mode gpu, cpu,gpu) ----
+  double cpu_gflops = 0.0;     // CPU GFLOP/s per process (0 = calibrate at start)
+  double gpu_mult = 100.0;     // GPU FLOP/s = gpu_mult x CPU FLOP/s per process
+  double gpu_gflops = 0.0;     // >0: absolute GPU GFLOP/s per device (overrides mult)
+  int gpu_streams = 16;        // max concurrent streams (jobs) per device
+  bool pack = true;            // false: one task at a time per rank (baseline)
+  bool spill = true;           // cpu,gpu: CPU-routed tasks may use spare GPU capacity
+  bool rebalance = true;       // cpu,gpu: idle CPU takes a waiting GPU task if it finishes sooner
+  int gpu_depth = 2;           // units in flight per GPU job
+  int gpu_tile = 64;           // DGEMM output tile edge for the occupancy model
+  int ctas_per_sm = 2;         // concurrent GEMM tiles per SM
+  double launch_us = 5.0;      // per kernel launch overhead in the demand model
+  double unit_ms = 20.0;       // target duration of one inference GPU unit (chunk)
+  double gpu_poll_us = 100.0;  // orchestrator back-off when nothing progressed
+  double max_wait_ms = 200.0;  // a blocked GPU task older than this stops backfilling
   std::vector<std::string> init_tokens;  // p:/s:/r:/e: given on the command line
 };
 
@@ -207,7 +229,10 @@ enum Status { CONTINUE, COMPLETED, PREEMPTED, SUSPENDED, EXIT_SAVE, EXIT_NOSAVE,
   X(t_ctl) X(t_sched) X(t_ckpt) X(wall) X(loss_ratio_sum) X(epochs_run)       \
   X(samples_run) X(pending_left) X(checksum)                                  \
   X(train_done_gpu) X(infer_done_gpu) X(flops_train_gpu) X(flops_infer_gpu)   \
-  X(exec_gpu) X(t_gpu) X(gpu_fallbacks) X(gpu_dev)
+  X(exec_gpu) X(t_gpu) X(gpu_fallbacks) X(gpu_dev)                           \
+  X(t_busy) X(cap_cpu) X(cap_gpu) X(slot_limit) X(gpu_jobs) X(conc_int)       \
+  X(max_conc) X(dem_int) X(spilled) X(sched_iters) X(sharers) X(t_cpu_occ)   \
+  X(rebalanced)
 
 struct Stats {
 #define DECL(n) double n = 0;
@@ -233,7 +258,11 @@ struct Stats {
 #undef FROM
   }
 };
-static Stats st;
+// thread_local: in the concurrent engine the CPU kernels run on a worker thread
+// with their own counters, merged into the main thread's at the end.
+static thread_local Stats st;
+static thread_local bool tl_in_worker = false;
+static bool g_concurrent = false;  // exec_mode gpu / cpu,gpu engine active
 
 struct Sample { double t, exec_train, exec_infer, busy, idle, susp, p, exec_gpu; };
 static constexpr int SAMPLE_DOUBLES = 8;
@@ -453,16 +482,58 @@ static void poll_control() {
   st.t_ctl += last_poll - t0;
 }
 
+// ----------------------------------------------------------------------------
+// CPU worker (concurrent engine only): runs the unchanged CPU kernels on a
+// separate thread so the main thread can keep feeding GPU streams. It never
+// calls MPI for communication; interrupts reach it through `intr`, which
+// check_interrupt() reads between epochs / samples.
+// ----------------------------------------------------------------------------
+struct CpuWorker {
+  std::thread th;
+  std::mutex m;
+  std::condition_variable cv;
+  bool has = false, quit = false;  // guarded by m
+  std::atomic<bool> done{false};
+  bool running = false;            // main thread's view
+  Task task;
+  Status result = CONTINUE;
+  bool from_drain = false;
+  std::atomic<int> intr{CONTINUE};
+  std::atomic<double> pub_exec_train{0}, pub_exec_infer{0};
+  Stats final_stats;               // worker's counters, handed over at exit
+};
+static CpuWorker g_cpu;
+
+static void worker_publish() {
+  g_cpu.pub_exec_train.store(st.exec_train, std::memory_order_relaxed);
+  g_cpu.pub_exec_infer.store(st.exec_infer, std::memory_order_relaxed);
+}
+
+static double cum_exec_train() {
+  return st.exec_train + (g_concurrent ? g_cpu.pub_exec_train.load() : 0.0);
+}
+static double cum_exec_infer() {
+  return st.exec_infer + (g_concurrent ? g_cpu.pub_exec_infer.load() : 0.0);
+}
+static double cum_busy() { return g_concurrent ? st.t_busy : st.t_train + st.t_infer; }
+
 static void sample_timeline(double now, bool force = false) {
+  if (tl_in_worker) return;  // main thread only
   if (!force && now < g_next_sample) return;
-  g_timeline.push_back({now - g_t0, st.exec_train, st.exec_infer, st.t_train + st.t_infer,
-                        st.t_idle, susp_me ? 1.0 : 0.0, cur_p, st.exec_gpu});
+  g_timeline.push_back({now - g_t0, cum_exec_train(), cum_exec_infer(), cum_busy(), st.t_idle,
+                        susp_me ? 1.0 : 0.0, cur_p, st.exec_gpu});
   g_next_sample = now + cfg.timeline_ms * 1e-3;
 }
 
 // Called between units of work (epochs / samples) inside a task.
 static Status check_interrupt(int type) {
   if (selftest_mode) return CONTINUE;
+  if (tl_in_worker) {  // concurrent engine: the orchestrator decides
+    worker_publish();
+    int s = g_cpu.intr.load(std::memory_order_acquire);
+    if (s == PREEMPTED && type != TRAIN) return CONTINUE;
+    return s == CONTINUE ? CONTINUE : (Status)s;
+  }
   double now = MPI_Wtime();
   sample_timeline(now);
   if (now - last_poll < poll_s) return CONTINUE;
@@ -573,10 +644,128 @@ static Status run_inference(Task& t, int stop_at = -1) {
 }
 
 // ----------------------------------------------------------------------------
-// GPU kernels (cuBLAS, gpu_kernels.cu). Same algorithm, same data, same
-// interrupt points (between epochs / samples) and the same checkpoint content
-// as the CPU versions above, so a task checkpointed on one device can resume
-// on the other.
+// GPU capacity model
+//
+//   capacity per device  C = gpu_mult x (CPU FLOP/s per process)   [or --gpu-gflops]
+//   share per rank         = C / (#ranks sharing that device), same for streams
+//
+// Every task shape gets a modelled DEMAND: the FLOP/s it can usefully consume
+// on the device, from its shape and operations:
+//   training  (DGEMM-bound)  occupancy = output tiles (gpu_tile^2) of its GEMMs
+//                            / (SMs x ctas_per_sm), demand = C x min(1, occ)
+//   inference (GEMV-bound)   memory-bound: each weight (8 B) feeds 2 FLOPs, so
+//                            demand <= DRAM_BW/4; occupancy = rows in flight /
+//                            (SMs x 2048 threads)
+//   both                     demand <= FLOPs per unit / (launches x launch_us)
+// The scheduler packs jobs while  sum(demand) <= share, #jobs <= streams share,
+// sum(GEMV demand) <= bandwidth share, and the memory estimate fits.
+// ----------------------------------------------------------------------------
+struct Capacity {
+  double cpu = 0;        // CPU FLOP/s per process
+  double gpu_dev = 0;    // GPU FLOP/s per device
+  double gpu_share = 0;  // this rank's share
+  double bw_dev = 0;     // GEMV FLOP/s bound per device (DRAM_BW / 4)
+  double bw_share = 0;
+  double mem_share = 0;  // device bytes this rank may plan to use
+  int sm = 1, sharers = 1, slot_limit = 1;
+};
+static Capacity g_cap;
+
+struct GpuCost {
+  double demand = 0;      // FLOP/s
+  double unit_flops = 0;  // per epoch / per chunk
+  int chunk = 1;          // inference samples per unit
+  double mem = 0;         // device bytes
+  bool gemv = false;
+};
+static std::vector<GpuCost> g_cost[2];
+
+static double ceil_div(double a, double b) { return std::ceil(a / b); }
+
+static GpuCost train_cost(const TrainShape& s) {
+  GpuCost c;
+  const double T = cfg.gpu_tile;
+  double tiles = (ceil_div(s.B, T) * ceil_div(s.N, T) + ceil_div(s.K, T) * ceil_div(s.N, T) +
+                  ceil_div(s.B, T) * ceil_div(s.K, T)) / 3.0;
+  double occ = std::min(1.0, tiles / (double)(g_cap.sm * cfg.ctas_per_sm));
+  c.unit_flops = train_epoch_flops(s);
+  const double launches = 9.0;  // 3 GEMM + AXPY + dY/loss + 3 reduce + copy
+  double launch_bound = c.unit_flops / (launches * cfg.launch_us * 1e-6);
+  c.demand = std::min(g_cap.gpu_dev * occ, launch_bound);
+  c.mem = 8.0 * (2.0 * s.B * s.K + 3.0 * s.B * s.N + 2.0 * s.K * s.N + 70000);
+  return c;
+}
+
+static GpuCost infer_cost(const InferShape& s) {
+  GpuCost c;
+  c.gemv = true;
+  const double sf = infer_sample_flops(s);
+  double rows = 0, nw = 0, nb = 0;
+  int maxd = 0;
+  for (int l = 0; l < s.L; ++l) {
+    rows += s.d[l + 1];
+    nw += (double)s.d[l + 1] * s.d[l];
+    nb += s.d[l + 1];
+  }
+  for (int l = 0; l <= s.L; ++l) maxd = std::max(maxd, s.d[l]);
+  rows /= s.L;
+  const double launches_per_layer = 3.0, launches_fixed = 4.0;
+  auto demand_for = [&](int chunk) {
+    double occ = std::min(1.0, rows * chunk / (double)(g_cap.sm * 2048));
+    double peak = std::min(g_cap.gpu_dev, g_cap.bw_dev > 0 ? g_cap.bw_dev : g_cap.gpu_dev);
+    double launch_bound = chunk * sf / ((launches_per_layer * s.L + launches_fixed) *
+                                        cfg.launch_us * 1e-6);
+    return std::min(peak * occ, launch_bound);
+  };
+  // chunk size: as many samples as fit ~unit_ms at the resulting demand
+  int chunk = std::min(gpu::max_chunk(), s.batch);
+  for (int it = 0; it < 3; ++it) {
+    double d = demand_for(chunk);
+    int want = (int)std::ceil(d * cfg.unit_ms * 1e-3 / std::max(sf, 1.0));
+    chunk = std::max(1, std::min({want, gpu::max_chunk(), s.batch}));
+  }
+  c.chunk = chunk;
+  c.demand = demand_for(chunk);
+  c.unit_flops = chunk * sf;
+  c.mem = 8.0 * (nw + nb + (double)s.batch * s.d[0] + 2.0 * gpu::max_chunk() * maxd + 70000);
+  return c;
+}
+
+static void precompute_gpu_costs() {
+  g_cost[TRAIN].resize(cfg.nshapes);
+  g_cost[INFER].resize(cfg.nshapes);
+  for (int i = 0; i < cfg.nshapes; ++i) {
+    g_cost[TRAIN][i] = train_cost(g_tshapes[i]);
+    g_cost[INFER][i] = infer_cost(g_ishapes[i]);
+  }
+}
+
+// Calibrate the CPU FLOP rate of this process: single-threaded DGEMM.
+static double calibrate_cpu_flops() {
+  const int n = 384;
+  std::vector<double> A((size_t)n * n), B((size_t)n * n), C((size_t)n * n);
+  fill_uniform(A.data(), A.size(), 1, 1.0);
+  fill_uniform(B.data(), B.size(), 2, 1.0);
+  cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, n, n, 1.0, A.data(), n, B.data(), n,
+              0.0, C.data(), n);  // warm-up
+  int reps = 0;
+  double t0 = MPI_Wtime(), t = 0;
+  do {
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, n, n, 1.0, A.data(), n, B.data(),
+                n, 0.0, C.data(), n);
+    ++reps;
+    t = MPI_Wtime() - t0;
+  } while (t < 0.25);
+  g_sink += C[0];
+  return 2.0 * n * n * n * reps / t;
+}
+
+// ----------------------------------------------------------------------------
+// GPU jobs. A job is one task resident on one stream slot. It is advanced by
+// job_service() without blocking: retire finished units (events), then
+// enqueue up to gpu_depth units ahead. Interrupts take effect at unit
+// boundaries: pending units finish, then the task state (W / checksum) is
+// pulled back for the checkpoint — exactly the state the CPU kernels keep.
 // ----------------------------------------------------------------------------
 [[noreturn]] static void gpu_fatal(const char* where) {
   std::fprintf(stderr, "r%d: fatal GPU error in %s: %s\n", g_rank, where, gpu::last_error());
@@ -585,50 +774,35 @@ static Status run_inference(Task& t, int stop_at = -1) {
   std::abort();
 }
 
-static Status run_training_gpu(Task& t, int stop_at = -1) {
-  const TrainShape& s = g_tshapes[t.shape];
-  const int B = s.B, K = s.K, N = s.N;
-  double lr = 0.0;
-  if (gpu::train_begin(B, K, N, mix3(cfg.seed, t.id, 1), mix3(cfg.seed, t.id, 2),
-                       mix3(cfg.seed, t.id, 3), 1.0 / std::sqrt((double)K),
-                       t.W.empty() ? nullptr : t.W.data(), &lr) != 0)
-    return GPU_UNAVAILABLE;  // nothing in t was modified: safe to run on the CPU
-  const double ef = train_epoch_flops(s);
-  auto pull_W = [&] {  // device -> task state (checkpoint / completion)
-    t.W.resize((size_t)K * N);
-    if (gpu::train_download_W(t.W.data()) != 0) gpu_fatal("train_download_W");
-  };
-  double loss = 0.0;
+struct GpuJob {
+  Task task;
+  int slot = -1;
+  GpuCost cost;
+  bool from_drain = false, spilled = false;
+  int total = 0;     // epochs or batch size
+  int next = 0;      // first epoch / sample not yet enqueued
+  struct Unit { int ring, start, count; } u[gpu::RING];
+  int head = 0, n = 0, ring_next = 0;
+  int stop_req = CONTINUE;  // pending interrupt
+  double last_loss = 0;
+};
 
-  for (int e = t.progress; e < cfg.epochs; ++e) {
-    if (e == stop_at) {
-      pull_W();
-      return PREEMPTED;
-    }
-    Status cs = check_interrupt(TRAIN);
-    if (cs != CONTINUE) {
-      if (cs != EXIT_NOSAVE) pull_W();
-      return cs;
-    }
-    double t0 = MPI_Wtime();
-    if (gpu::train_epoch(lr, &loss) != 0) gpu_fatal("train_epoch");
-    if (e == 0) t.acc = loss;
-    t.progress = e + 1;
-    t.flops_run += ef;
-    st.exec_train += ef;
-    st.exec_gpu += ef;
-    st.epochs_run += 1;
-    double dt = MPI_Wtime() - t0;
-    st.t_train += dt;
-    st.t_gpu += dt;
+// Upload / generate the task's data on the job's slot. OK, OOM or ERR.
+static int job_begin(GpuJob& j) {
+  Task& t = j.task;
+  j.cost = g_cost[t.type][t.shape];
+  j.next = t.progress;
+  j.head = j.n = j.ring_next = 0;
+  j.stop_req = CONTINUE;
+  if (t.type == TRAIN) {
+    const TrainShape& s = g_tshapes[t.shape];
+    j.total = cfg.epochs;
+    return gpu::train_begin(j.slot, s.B, s.K, s.N, mix3(cfg.seed, t.id, 1),
+                            mix3(cfg.seed, t.id, 2), mix3(cfg.seed, t.id, 3),
+                            1.0 / std::sqrt((double)s.K), t.W.empty() ? nullptr : t.W.data());
   }
-  pull_W();
-  if (t.acc > 0) st.loss_ratio_sum += loss / t.acc;
-  return COMPLETED;
-}
-
-static Status run_inference_gpu(Task& t, int stop_at = -1) {
   const InferShape& s = g_ishapes[t.shape];
+  j.total = s.batch;
   uint64_t sw[MAXL], sb[MAXL];
   double scw[MAXL];
   for (int l = 0; l < s.L; ++l) {
@@ -636,50 +810,112 @@ static Status run_inference_gpu(Task& t, int stop_at = -1) {
     sb[l] = mix3(cfg.seed, t.id, 200 + l);
     scw[l] = std::sqrt(3.0 / s.d[l]);
   }
-  if (gpu::infer_begin(s.batch, s.L, s.d, sw, scw, sb, 0.1, mix3(cfg.seed, t.id, 99), t.acc) != 0)
-    return GPU_UNAVAILABLE;
-  const double sf = infer_sample_flops(s);
-  auto pull_acc = [&] {
-    if (gpu::infer_get_acc(&t.acc) != 0) gpu_fatal("infer_get_acc");
-  };
-
-  for (int i = t.progress; i < s.batch; ++i) {
-    if (i == stop_at) {
-      pull_acc();
-      return PREEMPTED;
-    }
-    Status cs = check_interrupt(INFER);
-    if (cs != CONTINUE) {
-      if (cs != EXIT_NOSAVE) pull_acc();
-      return cs;
-    }
-    double t0 = MPI_Wtime();
-    if (gpu::infer_sample(i) != 0) gpu_fatal("infer_sample");
-    t.progress = i + 1;
-    t.flops_run += sf;
-    st.exec_infer += sf;
-    st.exec_gpu += sf;
-    st.samples_run += 1;
-    double dt = MPI_Wtime() - t0;
-    st.t_infer += dt;
-    st.t_gpu += dt;
-  }
-  pull_acc();
-  return COMPLETED;
+  return gpu::infer_begin(j.slot, s.batch, s.L, s.d, sw, scw, sb, 0.1, mix3(cfg.seed, t.id, 99),
+                          t.acc);
 }
 
-// Dispatch one task to the CPU or GPU implementation. *on_gpu reports where it ran.
+static void job_commit(GpuJob& j, const GpuJob::Unit& u) {
+  Task& t = j.task;
+  double f;
+  if (t.type == TRAIN) {
+    double loss = gpu::ring_value(j.slot, u.ring);
+    if (u.start == 0) t.acc = loss;
+    j.last_loss = loss;
+    t.progress = u.start + 1;
+    f = j.cost.unit_flops;
+    st.exec_train += f;
+    st.epochs_run += 1;
+  } else {
+    t.progress = u.start + u.count;
+    f = u.count * infer_sample_flops(g_ishapes[t.shape]);
+    st.exec_infer += f;
+    st.samples_run += u.count;
+  }
+  t.flops_run += f;
+  st.exec_gpu += f;
+}
+
+// Advance a job. Returns CONTINUE while it is running; otherwise its final
+// status (task state already pulled back to the host). `progressed` is set
+// if any unit retired or was enqueued. stop_at >= 0: stop there (self test).
+static Status job_service(GpuJob& j, bool* progressed, int stop_at = -1) {
+  Task& t = j.task;
+  while (j.n > 0) {  // retire completed units (in order)
+    const GpuJob::Unit& u = j.u[j.head];
+    int q = gpu::query(j.slot, u.ring);
+    if (q < 0) gpu_fatal("event query");
+    if (q == 0) break;
+    job_commit(j, u);
+    j.head = (j.head + 1) % gpu::RING;
+    j.n--;
+    *progressed = true;
+  }
+  if (j.stop_req == EXIT_NOSAVE) return EXIT_NOSAVE;  // abandon, in-flight work dropped
+  const int end = stop_at >= 0 ? std::min(j.total, stop_at) : j.total;
+  if (j.stop_req != CONTINUE || j.next >= end) {
+    if (j.n > 0) return CONTINUE;  // let the in-flight units finish
+    if (t.type == TRAIN) {
+      const TrainShape& s = g_tshapes[t.shape];
+      t.W.resize((size_t)s.K * s.N);
+      if (gpu::train_download_W(j.slot, t.W.data()) != gpu::OK) gpu_fatal("download W");
+    } else if (gpu::infer_get_acc(j.slot, &t.acc) != gpu::OK) {
+      gpu_fatal("download checksum");
+    }
+    *progressed = true;
+    // completion wins over an interrupt that arrived while the last units ran
+    if (t.progress >= j.total) {
+      if (t.type == TRAIN && t.acc > 0) st.loss_ratio_sum += j.last_loss / t.acc;
+      return COMPLETED;
+    }
+    if (j.stop_req != CONTINUE) return (Status)j.stop_req;
+    return PREEMPTED;  // stop_at reached
+  }
+  const int depth = std::max(1, std::min(cfg.gpu_depth, gpu::RING));
+  while (j.n < depth && j.next < end) {  // keep the stream fed
+    int ring = j.ring_next;
+    j.ring_next = (j.ring_next + 1) % gpu::RING;
+    int count = t.type == TRAIN ? 1 : std::min(j.cost.chunk, end - j.next);
+    int rc = t.type == TRAIN ? gpu::train_enqueue_epoch(j.slot, ring)
+                             : gpu::infer_enqueue_chunk(j.slot, j.next, count, ring);
+    if (rc != gpu::OK) gpu_fatal("enqueue");
+    j.u[(j.head + j.n) % gpu::RING] = {ring, j.next, count};
+    j.n++;
+    j.next += count;
+    *progressed = true;
+  }
+  return CONTINUE;
+}
+
+// Run one task synchronously on GPU slot 0 (self test).
+static Status run_gpu_sync(Task& t, int stop_at, bool* ok) {
+  GpuJob j;
+  j.task = std::move(t);
+  j.slot = 0;
+  *ok = job_begin(j) == gpu::OK;
+  if (!*ok) {
+    t = std::move(j.task);
+    return GPU_UNAVAILABLE;
+  }
+  Status s;
+  bool prog = false;
+  while ((s = job_service(j, &prog, stop_at)) == CONTINUE) std::this_thread::yield();
+  t = std::move(j.task);
+  return s;
+}
+
+// Dispatch one task synchronously to the CPU or GPU implementation (self
+// test). *on_gpu reports where it ran.
 static Status run_task(Task& t, bool want_gpu, bool* on_gpu, int stop_at = -1) {
   if (want_gpu) {
-    Status s = t.type == TRAIN ? run_training_gpu(t, stop_at) : run_inference_gpu(t, stop_at);
-    if (s != GPU_UNAVAILABLE) {
+    bool ok = false;
+    Status s = run_gpu_sync(t, stop_at, &ok);
+    if (ok) {
       *on_gpu = true;
       return s;
     }
     st.gpu_fallbacks++;
-    if (st.gpu_fallbacks <= 3)
-      LOG("GPU unavailable for %s task %lld (%s) - running it on the CPU", tname(t.type),
-          (long long)t.id, gpu::last_error());
+    LOG("GPU unavailable for %s task %lld (%s) - running it on the CPU", tname(t.type),
+        (long long)t.id, gpu::last_error());
   }
   *on_gpu = false;
   return t.type == TRAIN ? run_training(t, stop_at) : run_inference(t, stop_at);
@@ -778,6 +1014,21 @@ static bool read_tasks(const std::string& path, std::deque<Task>& q) {
   return ok;
 }
 
+// On resume: replace the queue with what the checkpoint file holds, keeping
+// the in-memory per-run FLOP counters (not part of the file format) so work
+// executed before the suspension is still credited when the task completes.
+static void reload_pending() {
+  std::deque<Task> fromfile;
+  if (!read_tasks(ckpt_path(g_rank), fromfile)) return;
+  for (Task& t : fromfile)
+    for (const Task& m : pending)
+      if (m.id == t.id && m.type == t.type) {
+        t.flops_run = m.flops_run;
+        break;
+      }
+  pending.swap(fromfile);
+}
+
 static void save_pending() {
   double t0 = MPI_Wtime();
   if (write_tasks(ckpt_path(g_rank), pending, &st.ckpt_bytes)) st.ckpt_writes++;
@@ -788,7 +1039,7 @@ static void save_pending() {
 // Scheduling policy
 // ----------------------------------------------------------------------------
 static std::mt19937_64 g_rng;
-static bool force_infer = false;
+static int force_infer = 0;  // next N decisions are forced to inference
 static int since_sync = 0;
 
 static void sync_global_mix() {
@@ -801,8 +1052,8 @@ static void sync_global_mix() {
 // global (all ranks, synced every cfg.sync_every decisions) and local counters,
 // so both the machine-wide and per-rank train/infer mix track p.
 static int choose_type() {
-  if (force_infer) {
-    force_infer = false;
+  if (force_infer > 0) {
+    --force_infer;
     return INFER;
   }
   const double p = cur_p;
@@ -907,6 +1158,49 @@ static bool selftest() {
       }
     }
   }
+  // Several tasks resident on separate streams at once must each give the
+  // same result as running alone on the CPU (no cross-stream interference).
+  if (g_gpu_ready) {
+    std::vector<Task> ref;
+    for (int type : {TRAIN, INFER})
+      for (int64_t id : cheapest_ids(type, 3)) {
+        Task t;
+        t.type = type; t.id = id; t.shape = pick_shape(type, id);
+        ref.push_back(t);
+      }
+    int nj = std::min((int)ref.size(), cfg.gpu_streams);
+    std::vector<GpuJob> jobs(nj);
+    bool began = true;
+    for (int i = 0; i < nj; ++i) {
+      jobs[i].task = ref[i];
+      jobs[i].slot = i;
+      began = began && job_begin(jobs[i]) == gpu::OK;
+    }
+    for (int i = 0; i < nj; ++i) {  // CPU references
+      bool g;
+      run_task(ref[i], false, &g);
+    }
+    std::vector<Status> res(nj, CONTINUE);
+    for (int left = nj; began && left > 0;) {
+      for (int i = 0; i < nj; ++i) {
+        if (res[i] != CONTINUE) continue;
+        bool prog = false;
+        res[i] = job_service(jobs[i], &prog);
+        if (res[i] != CONTINUE) --left;
+      }
+      std::this_thread::yield();
+    }
+    double worst = 0;
+    bool ok = began;
+    for (int i = 0; i < nj && ok; ++i) {
+      ok = res[i] == COMPLETED;
+      worst = std::max(worst, rel_diff(ref[i], jobs[i].task));
+    }
+    bool pass = ok && worst <= 1e-9;
+    std::printf("  %-34s %d tasks on %d streams at once vs cpu   : %s (max rel diff %.2e)\n",
+                "concurrent gpu jobs", nj, nj, pass ? "PASS" : "FAIL", worst);
+    all_ok = all_ok && pass;
+  }
   selftest_mode = false;
   st = saved;
   return all_ok;
@@ -953,9 +1247,7 @@ static void run_loop() {
     if (was_susp) {
       was_susp = false;
       st.resumes++;
-      // reload from the file so what runs is exactly what was saved
-      std::deque<Task> fromfile;
-      if (read_tasks(ckpt_path(g_rank), fromfile)) pending.swap(fromfile);
+      reload_pending();  // run exactly what was saved
       drain = !pending.empty();
       LOG("RESUMED: %zu checkpoint(s) to drain before new tasks", pending.size());
     }
@@ -1025,7 +1317,7 @@ static void run_loop() {
             cfg.epochs);
         pending.push_back(std::move(task));
         save_pending();
-        force_infer = true;
+        force_infer = 1;
         break;
       case SUSPENDED:
         task.origin = ORIG_SUSPEND;
@@ -1053,8 +1345,488 @@ static void run_loop() {
     if (s == EXIT_SAVE || s == EXIT_NOSAVE) break;
   }
   st.wall = MPI_Wtime() - t_loop0;
+  st.t_busy = st.t_train + st.t_infer;
   for (const Task& t : pending) st.flops_pending += t.flops_run;
   st.pending_left = (double)pending.size();
+}
+
+// ----------------------------------------------------------------------------
+// Concurrent engine (exec_mode gpu / cpu,gpu)
+//
+// The main thread is an orchestrator: it polls control, retires/enqueues GPU
+// units on up to slot_limit streams, and starts tasks while the GPU has spare
+// modelled capacity (sum of demands <= capacity share) and, in cpu,gpu mode,
+// while the CPU worker is idle. Control semantics are those of run_loop():
+//   * priority rises -> every running training task (all GPU jobs and the CPU
+//     worker) checkpoints, and the next N decisions are inference
+//   * s:R -> all running tasks checkpoint, rank idles; r:R -> drains the
+//     checkpoints (no new task until they have all completed)
+//   * e:1 -> all running tasks checkpoint, exit; e:0 -> abandon, exit
+// ----------------------------------------------------------------------------
+static void cpu_worker_main() {
+  tl_in_worker = true;
+  std::unique_lock<std::mutex> lk(g_cpu.m);
+  for (;;) {
+    g_cpu.cv.wait(lk, [] { return g_cpu.has || g_cpu.quit; });
+    if (g_cpu.quit) break;
+    lk.unlock();
+    Task& t = g_cpu.task;  // owned by the worker while `has` is set
+    Status s = t.type == TRAIN ? run_training(t) : run_inference(t);
+    worker_publish();
+    lk.lock();
+    g_cpu.result = s;
+    g_cpu.has = false;
+    g_cpu.done.store(true, std::memory_order_release);
+  }
+  g_cpu.final_stats = st;
+}
+
+struct Staged {  // a task taken (NXTVAL or checkpoint queue) but not yet placed
+  Task task;
+  bool from_drain = false;
+  double t_staged = 0;
+};
+
+// FLOPs a task still has to execute
+static double remaining_flops(const Task& t) {
+  if (t.type == TRAIN)
+    return (cfg.epochs - t.progress) * train_epoch_flops(g_tshapes[t.shape]);
+  const InferShape& s = g_ishapes[t.shape];
+  return (s.batch - t.progress) * infer_sample_flops(s);
+}
+
+static void run_loop_concurrent() {
+  const bool cpu_slot = (cfg.exec_mode & EXEC_CPU) != 0;  // CPU takes regular tasks
+  std::vector<GpuJob> jobs;
+  std::vector<int> free_slots;
+  for (int i = g_cap.slot_limit - 1; i >= 0; --i) free_slots.push_back(i);
+  double sum_dem = 0, sum_bw = 0, sum_mem = 0;
+  bool gpu_mem_full = false;  // an allocation failed; wait until a job finishes
+  std::deque<Staged> staged;
+  int cpu_type = TRAIN;
+  bool cpu_from_drain = false;
+  bool drain = !pending.empty();
+  bool was_susp = false, dirty = false;
+  int fallback_logs = 0;
+
+  g_cpu.th = std::thread(cpu_worker_main);
+  const double t_loop0 = MPI_Wtime();
+  double t_last = t_loop0;
+
+  auto note_resumed = [&](const Task& t) {
+    (t.type == TRAIN ? st.train_resumed : st.infer_resumed) += 1;
+    dirty = true;  // the checkpoint file mirrors the queue
+    if (cfg.verbose > 1)
+      LOG("resume %s task %lld (%s) at %d", tname(t.type), (long long)t.id, oname(t.origin),
+          t.progress);
+  };
+  auto cpu_idle = [&] { return !g_cpu.running && (cfg.pack || jobs.empty()); };
+  auto gpu_fits = [&](const GpuCost& c) {
+    if (free_slots.empty()) return false;
+    if (!cfg.pack) return jobs.empty() && !g_cpu.running;
+    if (jobs.empty()) return true;  // a task bigger than the share still has to run
+    if (gpu_mem_full) return false;
+    const double eps = 1e-9;
+    if (sum_dem + c.demand > g_cap.gpu_share * (1 + eps)) return false;
+    if (c.gemv && g_cap.bw_share > 0 && sum_bw + c.demand > g_cap.bw_share * (1 + eps))
+      return false;
+    return sum_mem + c.mem <= g_cap.mem_share;
+  };
+  // smallest demand of any task that may run on the GPU: "room" means at
+  // least that much capacity is still free
+  double min_dem = INFINITY;
+  for (int ty = 0; ty < 2; ++ty)
+    for (int i = 0; i < cfg.nshapes; ++i)
+      if (route_to_gpu(ty, i) || (cfg.spill && cpu_slot))
+        min_dem = std::min(min_dem, g_cost[ty][i].demand);
+  auto gpu_room = [&] {
+    if (free_slots.empty()) return false;
+    if (!cfg.pack) return jobs.empty() && !g_cpu.running;
+    return jobs.empty() ||
+           (!gpu_mem_full && sum_dem + min_dem <= g_cap.gpu_share * (1 + 1e-9));
+  };
+  auto start_cpu = [&](Staged& x) {
+    cpu_type = x.task.type;
+    cpu_from_drain = x.from_drain;
+    {
+      std::lock_guard<std::mutex> lk(g_cpu.m);
+      g_cpu.task = std::move(x.task);
+      g_cpu.intr.store(CONTINUE);
+      g_cpu.done.store(false);
+      g_cpu.has = true;
+    }
+    g_cpu.cv.notify_one();
+    g_cpu.running = true;
+    st.task_runs++;
+    st.loops++;
+  };
+  // returns false (task left in x) if the device memory is exhausted
+  auto start_gpu = [&](Staged& x, bool spilled) {
+    GpuJob j;
+    j.task = std::move(x.task);
+    j.slot = free_slots.back();
+    j.from_drain = x.from_drain;
+    j.spilled = spilled;
+    int rc = job_begin(j);
+    if (rc == gpu::OOM) {  // free the pools of idle slots and retry once
+      for (int s : free_slots)
+        if (s != j.slot) gpu::release_slot(s);
+      rc = job_begin(j);
+    }
+    if (rc == gpu::ERR) gpu_fatal("job begin");
+    if (rc == gpu::OOM) {
+      x.task = std::move(j.task);
+      gpu_mem_full = true;
+      return false;
+    }
+    free_slots.pop_back();
+    sum_dem += j.cost.demand;
+    if (j.cost.gemv) sum_bw += j.cost.demand;
+    sum_mem += j.cost.mem;
+    st.gpu_jobs++;
+    st.task_runs++;
+    st.loops++;
+    if (spilled) st.spilled++;
+    jobs.push_back(std::move(j));
+    st.max_conc = std::max(st.max_conc, (double)jobs.size());
+    return true;
+  };
+  // GPU admission policy for the staged tasks of one fill pass:
+  //   * GPU-routed tasks have priority on the GPU: no spill while one waits
+  //   * backfilling (a later, smaller task passing a blocked one) is allowed
+  //     until the oldest blocked GPU task has waited max_wait_ms; then only it
+  //     may start on the GPU (no starvation of large tasks)
+  bool gpu_waiting = false;  // some GPU-routed task is staged
+  const Staged* aged = nullptr;  // oldest over-age GPU-routed staged task
+  // Earliest-finish-time check for a GPU-routed task blocked behind GPU work:
+  // would it finish sooner on the (idle) CPU? Rates are the measured ones once
+  // there is enough history, the modelled ones before.
+  double gpu_ahead = 0;  // FLOPs queued ahead on the GPU (running + earlier staged)
+  auto cpu_rate = [&] {
+    double ex = g_cpu.pub_exec_train.load() + g_cpu.pub_exec_infer.load();
+    return st.t_cpu_occ > 0.5 && ex > 0 ? ex / st.t_cpu_occ : g_cap.cpu;
+  };
+  auto gpu_rate = [&] {
+    return st.t_gpu > 0.5 && st.exec_gpu > 0 ? std::min(st.exec_gpu / st.t_gpu, g_cap.gpu_share)
+                                             : g_cap.gpu_share;
+  };
+  auto cpu_finishes_sooner = [&](const Task& t) {
+    const double f = remaining_flops(t);
+    const double gr = gpu_rate();
+    const double t_gpu = gpu_ahead / gr + f / std::max(1.0, std::min(g_cost[t.type][t.shape].demand, gr));
+    return f / cpu_rate() < t_gpu;
+  };
+  auto try_place = [&](Staged& x) {
+    const Task& t = x.task;
+    const GpuCost& c = g_cost[t.type][t.shape];
+    if (route_to_gpu(t.type, t.shape)) {
+      if (cpu_slot && cfg.rebalance && cfg.pack && cpu_idle() && !jobs.empty() &&
+          cpu_finishes_sooner(t)) {
+        st.rebalanced++;
+        start_cpu(x);
+        return true;
+      }
+      if (aged && aged != &x) return false;
+      if (!gpu_fits(c)) {
+        gpu_ahead += remaining_flops(t);  // later staged tasks queue behind this one
+        return false;
+      }
+      if (start_gpu(x, false)) return true;
+      if (jobs.empty() && !g_cpu.running) {  // nothing to wait for: use the CPU
+        st.gpu_fallbacks++;
+        if (fallback_logs++ < 3)
+          LOG("GPU unavailable for %s task %lld (%s) - running it on the CPU", tname(t.type),
+              (long long)t.id, gpu::last_error());
+        start_cpu(x);
+        return true;
+      }
+      return false;
+    }
+    if (cpu_slot && cpu_idle()) {
+      start_cpu(x);
+      return true;
+    }
+    if (cfg.spill && cfg.pack && !gpu_waiting && gpu_fits(c) && start_gpu(x, true)) return true;
+    return false;
+  };
+  auto handle_result = [&](Task&& task, Status s, bool on_gpu) {
+    const char* dev = on_gpu ? "gpu" : "cpu";
+    switch (s) {
+      case COMPLETED:
+        if (task.type == TRAIN) {
+          st.train_done++;
+          st.flops_train += task.flops_run;
+          if (on_gpu) st.train_done_gpu++, st.flops_train_gpu += task.flops_run;
+        } else {
+          st.infer_done++;
+          st.flops_infer += task.flops_run;
+          st.checksum += task.acc;
+          if (on_gpu) st.infer_done_gpu++, st.flops_infer_gpu += task.flops_run;
+        }
+        break;
+      case PREEMPTED:
+        task.origin = ORIG_PREEMPT;
+        st.preempts++;
+        force_infer++;
+        LOG("priority -> %.3f: training task %lld (%s) checkpointed at epoch %d/%d, switching "
+            "to inference", cur_p, (long long)task.id, dev, task.progress, cfg.epochs);
+        pending.push_back(std::move(task));
+        dirty = true;
+        break;
+      case SUSPENDED:
+        task.origin = ORIG_SUSPEND;
+        LOG("suspend: %s task %lld (%s) checkpointed at %d", tname(task.type),
+            (long long)task.id, dev, task.progress);
+        pending.push_front(std::move(task));  // in-flight work drains first on resume
+        dirty = true;
+        break;
+      case EXIT_SAVE:
+        task.origin = ORIG_EXIT;
+        LOG("exit e:1: %s task %lld (%s) checkpointed at %d", tname(task.type),
+            (long long)task.id, dev, task.progress);
+        pending.push_front(std::move(task));
+        dirty = true;
+        break;
+      case EXIT_NOSAVE:
+        st.flops_discarded += task.flops_run;
+        LOG("exit e:0: %s task %lld (%s) abandoned at %d (no checkpoint)", tname(task.type),
+            (long long)task.id, dev, task.progress);
+        break;
+      default:
+        break;
+    }
+  };
+  auto unstage_all = [&] {  // staged tasks become (progress 0) checkpoints
+    while (!staged.empty()) {
+      pending.push_front(std::move(staged.back().task));
+      staged.pop_back();
+      dirty = true;
+    }
+  };
+
+  while (true) {
+    // ---- time accounting for the interval since the previous iteration ----
+    double now = MPI_Wtime();
+    double dt = now - t_last;
+    t_last = now;
+    st.sched_iters++;
+    if (!jobs.empty()) {
+      st.t_gpu += dt;
+      st.conc_int += jobs.size() * dt;
+      st.dem_int += std::min(sum_dem, g_cap.gpu_share) * dt;
+    }
+    if (g_cpu.running) st.t_cpu_occ += dt;
+    if (!jobs.empty() || g_cpu.running) st.t_busy += dt;
+    else if (susp_me) st.t_idle += dt;
+    sample_timeline(now);
+    bool prog = false;
+    if (now - last_poll >= poll_s) poll_control();
+
+    // ---- 1. propagate control state to running tasks ----
+    const int intr = cur_exit == 0 ? EXIT_NOSAVE
+                     : cur_exit == 1 ? EXIT_SAVE
+                     : susp_me       ? SUSPENDED
+                                     : CONTINUE;
+    if (intr == CONTINUE && prio_event) {
+      int n = 0;
+      for (auto& j : jobs)
+        if (j.task.type == TRAIN && j.stop_req == CONTINUE) j.stop_req = PREEMPTED, ++n;
+      if (g_cpu.running && cpu_type == TRAIN && g_cpu.intr.load() == CONTINUE)
+        g_cpu.intr.store(PREEMPTED), ++n;
+      // not-yet-started training tasks step aside as well
+      for (auto it = staged.begin(); it != staged.end();) {
+        if (it->task.type == TRAIN && !it->from_drain) {
+          pending.push_back(std::move(it->task));
+          it = staged.erase(it);
+          dirty = true;
+        } else {
+          ++it;
+        }
+      }
+      if (n)
+        LOG("priority -> %.3f: checkpointing %d running training task(s) before taking "
+            "inference", cur_p, n);
+    } else if (intr != CONTINUE) {
+      for (auto& j : jobs)
+        if (j.stop_req == CONTINUE || intr == EXIT_NOSAVE) j.stop_req = intr;
+      if (g_cpu.running && (g_cpu.intr.load() == CONTINUE || intr == EXIT_NOSAVE))
+        g_cpu.intr.store(intr, std::memory_order_release);
+    }
+    prio_event = false;
+
+    // ---- 2. advance GPU jobs ----
+    for (size_t i = 0; i < jobs.size();) {
+      Status s = job_service(jobs[i], &prog);
+      if (s == CONTINUE) {
+        ++i;
+        continue;
+      }
+      GpuJob j = std::move(jobs[i]);
+      jobs[i] = std::move(jobs.back());
+      jobs.pop_back();
+      free_slots.push_back(j.slot);
+      sum_dem -= j.cost.demand;
+      if (j.cost.gemv) sum_bw -= j.cost.demand;
+      sum_mem -= j.cost.mem;
+      if (jobs.empty()) sum_dem = sum_bw = sum_mem = 0;  // no drift
+      gpu_mem_full = false;
+      handle_result(std::move(j.task), s, true);
+      prog = true;
+    }
+    // ---- 3. CPU worker ----
+    if (g_cpu.running && g_cpu.done.load(std::memory_order_acquire)) {
+      Task t;
+      Status s;
+      {
+        std::lock_guard<std::mutex> lk(g_cpu.m);
+        t = std::move(g_cpu.task);
+        s = g_cpu.result;
+        g_cpu.done.store(false);
+      }
+      g_cpu.running = false;
+      handle_result(std::move(t), s, false);
+      prog = true;
+    }
+    if (dirty) {
+      save_pending();
+      dirty = false;
+    }
+
+    // ---- 4. exit ----
+    if (cur_exit >= 0) {
+      if (jobs.empty() && !g_cpu.running) {
+        if (cur_exit == 1) {
+          unstage_all();
+          save_pending();
+          LOG("exit e:1: %zu checkpoint(s) in %s", pending.size(), ckpt_path(g_rank).c_str());
+        }
+        break;
+      }
+      if (!prog) std::this_thread::sleep_for(std::chrono::microseconds((int)cfg.gpu_poll_us));
+      continue;
+    }
+
+    // ---- 5. suspension ----
+    if (susp_me) {
+      if (!jobs.empty() || g_cpu.running) {  // running tasks are still checkpointing
+        if (!prog) std::this_thread::sleep_for(std::chrono::microseconds((int)cfg.gpu_poll_us));
+        continue;
+      }
+      if (!was_susp) {
+        was_susp = true;
+        st.suspends++;
+        unstage_all();
+        save_pending();
+        dirty = false;
+        LOG("SUSPENDED: %zu checkpoint(s) saved to %s", pending.size(),
+            ckpt_path(g_rank).c_str());
+      }
+      st.idle_loops++;
+      st.loops++;
+      std::this_thread::sleep_for(std::chrono::microseconds(1000));
+      continue;
+    }
+    if (was_susp) {
+      was_susp = false;
+      st.resumes++;
+      reload_pending();  // run exactly what was saved
+      drain = !pending.empty();
+      LOG("RESUMED: %zu checkpoint(s) to drain before new tasks", pending.size());
+    }
+
+    // ---- 6. fill free capacity ----
+    double ts = MPI_Wtime();
+    for (int guard = 0; guard < 4 * gpu::MAX_SLOTS; ++guard) {
+      gpu_waiting = false;
+      aged = nullptr;
+      gpu_ahead = 0;
+      for (const GpuJob& j : jobs) gpu_ahead += remaining_flops(j.task);
+      for (const Staged& x : staged)
+        if (route_to_gpu(x.task.type, x.task.shape)) {
+          gpu_waiting = true;
+          if (!aged && now - x.t_staged > cfg.max_wait_ms * 1e-3) aged = &x;
+        }
+      for (auto it = staged.begin(); it != staged.end();) {
+        if (try_place(*it)) {
+          if (aged == &*it) aged = nullptr;
+          it = staged.erase(it);
+          prog = true;
+        } else {
+          ++it;
+        }
+      }
+      // Every staged task left here is blocked on its device. Look ahead only
+      // while some resource is free and nothing staged can use it: up to 4
+      // tasks to find one that fits the GPU's remaining capacity, up to 8 when
+      // the CPU is idle and everything staged is waiting for the GPU.
+      const bool want_cpu = cpu_slot && cpu_idle();
+      const bool want_gpu = gpu_room() && !aged;
+      if (!want_cpu && !want_gpu) break;
+      if (staged.size() >= (want_cpu ? 8u : 4u)) break;
+      Staged x;
+      if (drain) {
+        if (pending.empty()) {
+          bool outstanding = (g_cpu.running && cpu_from_drain);
+          for (auto& j : jobs) outstanding = outstanding || j.from_drain;
+          for (auto& s : staged) outstanding = outstanding || s.from_drain;
+          if (outstanding) break;  // checkpoints are consumed only when they complete
+          drain = false;
+          continue;
+        }
+        x.task = std::move(pending.front());
+        pending.pop_front();
+        x.from_drain = true;
+        note_resumed(x.task);
+      } else {
+        int type = choose_type();
+        auto it = std::find_if(pending.begin(), pending.end(),
+                               [&](const Task& t) { return t.type == type; });
+        if (it != pending.end()) {
+          x.task = std::move(*it);
+          pending.erase(it);
+          note_resumed(x.task);
+        } else {
+          x.task.type = type;
+          x.task.id = nxtval();
+          x.task.shape = pick_shape(type, x.task.id);
+          const int64_t one = 1;
+          MPI_Accumulate(&one, 1, MPI_INT64_T, 0, type == TRAIN ? W_GTRAIN : W_GINF, 1,
+                         MPI_INT64_T, MPI_SUM, g_win);
+          MPI_Win_flush(0, g_win);
+          (type == TRAIN ? st.train_new : st.infer_new) += 1;
+          if (++since_sync >= cfg.sync_every) {
+            since_sync = 0;
+            sync_global_mix();
+          }
+        }
+      }
+      x.t_staged = now;
+      staged.push_back(std::move(x));
+    }
+    st.t_sched += MPI_Wtime() - ts;
+    if (dirty) {
+      save_pending();
+      dirty = false;
+    }
+
+    if (!prog) std::this_thread::sleep_for(std::chrono::microseconds((int)cfg.gpu_poll_us));
+  }
+
+  st.wall = MPI_Wtime() - t_loop0;
+  for (const Task& t : pending) st.flops_pending += t.flops_run;
+  st.pending_left = (double)pending.size();
+  {  // stop the CPU worker and merge its counters
+    std::lock_guard<std::mutex> lk(g_cpu.m);
+    g_cpu.quit = true;
+  }
+  g_cpu.cv.notify_one();
+  g_cpu.th.join();
+  const int nf = Stats::count();
+  std::vector<double> a(nf), b(nf);
+  st.to(a.data());
+  g_cpu.final_stats.to(b.data());
+  for (int i = 0; i < nf; ++i) a[i] += b[i];
+  st.from(a.data());
 }
 
 // ----------------------------------------------------------------------------
@@ -1090,7 +1862,7 @@ static void report(const std::vector<double>& all, const std::vector<int>& tcoun
               "+-----------+------------------------\n");
   for (int r = 0; r < g_np; ++r) {
     const Stats& s = S[r];
-    double busy = s.t_train + s.t_infer;
+    double busy = s.t_busy;  // time with any task running (CPU or GPU)
     double w = std::max(s.wall, 1e-12);
     std::printf(" %4d | %6.0f %6.0f | %5.0f  %5.0f | %11.4f  %11.4f | %5.1f  %5.1f %5.1f | %9.3f "
                 "| %7.0f %7.0f %7.0f\n",
@@ -1101,7 +1873,7 @@ static void report(const std::vector<double>& all, const std::vector<int>& tcoun
   }
   std::printf("------+---------------+--------------+--------------------------+--------------------"
               "+-----------+------------------------\n");
-  double tb = T.t_train + T.t_infer;
+  double tb = T.t_busy;
   std::printf("  all | %6.0f %6.0f | %5.0f  %5.0f | %11.4f  %11.4f | %5.1f  %5.1f %5.1f | %9.3f "
               "| %7.0f %7.0f %7.0f\n",
               T.loops, T.idle_loops, T.train_done, T.infer_done, G(T.flops_train),
@@ -1137,10 +1909,14 @@ static void report(const std::vector<double>& all, const std::vector<int>& tcoun
               "syncs = %.0f\n", T.ctl_polls, T.ctl_changes / g_np, T.syncs);
   std::printf("   preemptions (p rose toward inference) = %.0f, suspends = %.0f, resumes = %.0f, "
               "checkpoint bytes written = %.0f\n", T.preempts, T.suspends, T.resumes, T.ckpt_bytes);
-  std::printf("   time split (all ranks): train %.1f%%  infer %.1f%%  suspended %.1f%%  control "
-              "%.1f%%  sched %.1f%%  ckpt-io %.2f%%\n",
-              100 * T.t_train / T.wall, 100 * T.t_infer / T.wall, 100 * T.t_idle / T.wall,
-              100 * T.t_ctl / T.wall, 100 * T.t_sched / T.wall, 100 * T.t_ckpt / T.wall);
+  std::printf("   time split (all ranks): CPU train %.1f%%  CPU infer %.1f%%  GPU active %.1f%%  "
+              "suspended %.1f%%  control %.1f%%  sched %.1f%%  ckpt-io %.2f%%\n",
+              100 * T.t_train / T.wall, 100 * T.t_infer / T.wall, 100 * T.t_gpu / T.wall,
+              100 * T.t_idle / T.wall, 100 * T.t_ctl / T.wall, 100 * T.t_sched / T.wall,
+              100 * T.t_ckpt / T.wall);
+  if (g_concurrent)
+    std::printf("   (concurrent engine: CPU and GPU time overlap; busy%% = time with any task "
+                "running; %.0f orchestrator iterations)\n", T.sched_iters);
 
   // ---- CPU vs GPU split ----
   static const char* mode_name[] = {"", "cpu", "gpu", "cpu,gpu"};
@@ -1153,8 +1929,7 @@ static void report(const std::vector<double>& all, const std::vector<int>& tcoun
   std::printf("------+-----+---------------+---------------+---------------------------+-----------"
               "----------------+--------------------+----------------\n");
   auto dev_row = [&](const char* lbl, const Stats& s, double wall_s) {
-    double tbusy = s.t_train + s.t_infer;
-    double tcpu = tbusy - s.t_gpu;
+    double tcpu = s.t_train + s.t_infer;  // CPU kernel time
     double ecpu = s.exec_train + s.exec_infer - s.exec_gpu;
     char dev[8];
     if (s.gpu_dev >= 0 && g_gpu_ready) std::snprintf(dev, sizeof dev, "g%-2.0f", s.gpu_dev);
@@ -1178,8 +1953,55 @@ static void report(const std::vector<double>& all, const std::vector<int>& tcoun
     TT.gpu_dev = -1;
     dev_row("all", TT, T.wall);
   }
-  std::printf("   GF/s = executed flops / time spent running on that device (per rank; 'all' = "
-              "mean over ranks).\n");
+  std::printf("   GF/s = executed flops / time that device was running work (per rank; 'all' "
+              "= ratio of sums).\n");
+
+  // ---- GPU capacity and packing ----
+  if (g_gpu_ready) {
+    std::printf("\n GPU capacity & packing  (capacity = %s; demand per task from its shape; "
+                "packing %s, spill %s, rebalance %s)\n",
+                cfg.gpu_gflops > 0 ? "--gpu-gflops" : "gpu_mult x CPU GFLOP/s per process",
+                cfg.pack ? "on" : "OFF", cfg.spill ? "on" : "off", cfg.rebalance ? "on" : "off");
+    std::printf(" rank | share | CPU GF/s | GPU cap GF/s | strm | jobs  spill rebal | avg conc max | "
+                "model util%% | GPU GF/s achieved (%% of cap) | CPU occ%% (kernel%%)\n");
+    std::printf("------+-------+----------+--------------+------+-------------------+--------------+----"
+                "---------+------------------------------+----------\n");
+    auto pack_row = [&](const char* lbl, const Stats& s, double cap, double w, double maxc,
+                        double sharers) {
+      double ach = s.exec_gpu / std::max(w, 1e-12);
+      std::printf(" %4s | 1/%-3.0f | %8.2f | %12.1f | %4.0f | %5.0f %5.0f %5.0f | %8.2f %3.0f | %11.1f | "
+                  "%14.2f (%9.1f%%) | %6.1f (%5.1f)\n",
+                  lbl, sharers, G(s.cap_cpu), G(cap), s.slot_limit, s.gpu_jobs, s.spilled, s.rebalanced,
+                  s.t_gpu > 0 ? s.conc_int / s.t_gpu : 0.0, maxc,
+                  100 * s.dem_int / std::max(cap * w, 1e-12), G(ach),
+                  100 * ach / std::max(cap, 1e-12), 100 * s.t_cpu_occ / std::max(w, 1e-12),
+                  100 * (s.t_train + s.t_infer) / std::max(w, 1e-12));
+    };
+    double maxc = 0;
+    for (int r = 0; r < g_np; ++r) {
+      char lbl[16];
+      std::snprintf(lbl, sizeof lbl, "%d", r);
+      pack_row(lbl, S[r], S[r].cap_gpu, S[r].wall, S[r].max_conc, S[r].sharers);
+      maxc = std::max(maxc, S[r].max_conc);
+    }
+    {  // whole machine: summed capacity and flops over the common wall time
+      double cap = T.cap_gpu;
+      double ach = T.exec_gpu / std::max(wall, 1e-12);
+      std::printf("  all |   -   | %8.2f | %12.1f | %4.0f | %5.0f %5.0f %5.0f | %8.2f %3.0f | %11.1f | "
+                  "%14.2f (%9.1f%%) | %6.1f (%5.1f)\n",
+                  G(T.cap_cpu / g_np), G(cap), T.slot_limit, T.gpu_jobs, T.spilled, T.rebalanced,
+                  T.t_gpu > 0 ? T.conc_int / T.t_gpu : 0.0, maxc,
+                  100 * T.dem_int / std::max(cap * wall, 1e-12), G(ach),
+                  100 * ach / std::max(cap, 1e-12), 100 * T.t_cpu_occ / std::max(wall * g_np, 1e-12),
+                  100 * (T.t_train + T.t_infer) / std::max(wall * g_np, 1e-12));
+    }
+    std::printf("   model util%% = time-integrated sum of running jobs' modelled demand / capacity "
+                "share; achieved = GPU flops / wall;\n   CPU occ%% = time a task was assigned to "
+                "the CPU worker, kernel%% = time inside the CPU BLAS loops.\n");
+    if (std::strstr(gpu::backend(), "emulation"))
+      std::printf("   NOTE: emulated device - 'achieved' is what the host thread(s) executing the "
+                  "emulated GPU deliver, not a real GPU.\n");
+  }
 
   // ---- utilization over time: busy% per rank in 10 equal windows ----
   const int NB = 10;
@@ -1266,6 +2088,20 @@ static void usage() {
       "                   (also --exec-mode MODE, or 'exec_mode: cpu,gpu')\n"
       "                   cpu,gpu: a task runs on the GPU iff its total FLOPs > threshold\n"
       "  --gpu-threshold F FLOPs per task above which cpu,gpu uses the GPU   (1e12)\n"
+      " capacity model / packing (exec_mode gpu, cpu,gpu):\n"
+      "  --cpu-gflops X    CPU GFLOP/s per process             (0 = calibrate)\n"
+      "  --gpu-mult X      GPU GFLOP/s = X * CPU GFLOP/s       (100)\n"
+      "  --gpu-gflops X    absolute GPU GFLOP/s per device     (overrides --gpu-mult)\n"
+      "  --gpu-streams N   max concurrent streams per device   (16, shared by its ranks)\n"
+      "  --no-pack         one task at a time per rank (baseline for comparison)\n"
+      "  --no-spill        cpu,gpu: CPU-routed tasks never use spare GPU capacity\n"
+      "  --no-rebalance    cpu,gpu: idle CPU never takes a waiting GPU-routed task\n"
+      "  --gpu-depth N     units in flight per GPU job          (2, max 4)\n"
+      "  --gpu-tile N      DGEMM tile edge in occupancy model   (64)\n"
+      "  --ctas-per-sm N   concurrent GEMM tiles per SM         (2)\n"
+      "  --launch-us X     kernel launch cost in demand model   (5)\n"
+      "  --unit-ms X       target duration of an inference GPU unit (20)\n"
+      "  --max-wait-ms X   blocked GPU task age that stops backfilling (200)\n"
       "  --epochs N        training epochs per task            (40)\n"
       "  --nshapes N       shape combinations per workload     (100)\n"
       "  --min-dim N       smallest random dimension           (256)\n"
@@ -1326,6 +2162,21 @@ static bool parse_args(int argc, char** argv) {
       cfg.exec_mode = m;
     }
     else if (a == "--gpu-threshold") cfg.gpu_threshold = std::stod(next("--gpu-threshold"));
+    else if (a == "--cpu-gflops") cfg.cpu_gflops = std::stod(next("--cpu-gflops"));
+    else if (a == "--gpu-mult") cfg.gpu_mult = std::stod(next("--gpu-mult"));
+    else if (a == "--gpu-gflops") cfg.gpu_gflops = std::stod(next("--gpu-gflops"));
+    else if (a == "--gpu-streams")
+      cfg.gpu_streams = std::max(1, std::min(gpu::MAX_SLOTS, std::stoi(next("--gpu-streams"))));
+    else if (a == "--no-pack") cfg.pack = false;
+    else if (a == "--no-spill") cfg.spill = false;
+    else if (a == "--no-rebalance") cfg.rebalance = false;
+    else if (a == "--gpu-depth")
+      cfg.gpu_depth = std::max(1, std::min(gpu::RING, std::stoi(next("--gpu-depth"))));
+    else if (a == "--gpu-tile") cfg.gpu_tile = std::max(1, std::stoi(next("--gpu-tile")));
+    else if (a == "--ctas-per-sm") cfg.ctas_per_sm = std::max(1, std::stoi(next("--ctas-per-sm")));
+    else if (a == "--launch-us") cfg.launch_us = std::max(0.0, std::stod(next("--launch-us")));
+    else if (a == "--unit-ms") cfg.unit_ms = std::max(0.01, std::stod(next("--unit-ms")));
+    else if (a == "--max-wait-ms") cfg.max_wait_ms = std::max(0.0, std::stod(next("--max-wait-ms")));
     else if (a == "--epochs") cfg.epochs = std::stoi(next("--epochs"));
     else if (a == "--nshapes") cfg.nshapes = std::stoi(next("--nshapes"));
     else if (a == "--min-dim") cfg.min_dim = std::stoi(next("--min-dim"));
@@ -1364,7 +2215,13 @@ static bool parse_args(int argc, char** argv) {
 int main(int argc, char** argv) {
   int provided = 0;
   // Only the main thread calls MPI; the monitor thread is MPI-free.
-  MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+  // The concurrent engine (exec_mode gpu / cpu,gpu) runs CPU kernels on a
+  // worker thread; only the main thread communicates, but the worker calls
+  // MPI_Wtime, so ask for MPI_THREAD_MULTIPLE in that case.
+  bool want_mt = false;
+  for (int i = 1; i < argc; ++i)
+    if (std::strstr(argv[i], "gpu") && std::strncmp(argv[i], "--gpu", 5) != 0) want_mt = true;
+  MPI_Init_thread(&argc, &argv, want_mt ? MPI_THREAD_MULTIPLE : MPI_THREAD_FUNNELED, &provided);
   MPI_Comm_rank(MPI_COMM_WORLD, &g_rank);
   MPI_Comm_size(MPI_COMM_WORLD, &g_np);
   g_t0 = MPI_Wtime();
@@ -1382,15 +2239,14 @@ int main(int argc, char** argv) {
 
   // GPU setup: node-local rank picks device (local_rank % #devices)
   st.gpu_dev = -1;
-  char gpu_name[256] = "";
+  gpu::DeviceInfo ginfo{};
   if (cfg.exec_mode & EXEC_GPU) {
     MPI_Comm node;
     MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, g_rank, MPI_INFO_NULL, &node);
     int local_rank = 0;
     MPI_Comm_rank(node, &local_rank);
-    MPI_Comm_free(&node);
-    double mem_gb = 0;
-    int dev = gpu::compiled() ? gpu::init(local_rank, gpu_name, sizeof gpu_name, &mem_gb) : -1;
+    int rc = gpu::compiled() ? gpu::init(local_rank, cfg.gpu_streams, &ginfo) : gpu::ERR;
+    int dev = rc == gpu::OK ? ginfo.device : -1;
     int ok = dev >= 0, all_ok = 0;
     MPI_Allreduce(&ok, &all_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     if (!ok) std::fprintf(stderr, "r%d: GPU initialisation failed: %s\n", g_rank, gpu::last_error());
@@ -1398,14 +2254,43 @@ int main(int argc, char** argv) {
       if (g_rank == 0)
         std::fprintf(stderr, "exec_mode includes gpu but not every rank could use a GPU; "
                              "run with exec_mode:cpu or fix the GPU setup.\n");
+      MPI_Comm_free(&node);
       gpu::shutdown();
       MPI_Finalize();
       return 1;
     }
     g_gpu_ready = true;
+    g_concurrent = true;
     st.gpu_dev = dev;
-    LOG("GPU %d (%s, %.1f GB) via %s, node-local rank %d", dev, gpu_name, mem_gb, gpu::backend(),
-        local_rank);
+
+    // ---- capacity model ----
+    // ranks sharing this device split its capacity, streams and memory
+    MPI_Comm devcomm;
+    MPI_Comm_split(node, dev, local_rank, &devcomm);
+    MPI_Comm_size(devcomm, &g_cap.sharers);
+    MPI_Comm_free(&devcomm);
+    MPI_Comm_free(&node);
+    double cpu = cfg.cpu_gflops > 0 ? cfg.cpu_gflops * 1e9 : calibrate_cpu_flops();
+    double cpu_sum = 0;
+    MPI_Allreduce(&cpu, &cpu_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    g_cap.cpu = cpu_sum / g_np;  // mean CPU FLOP/s per process
+    g_cap.gpu_dev = cfg.gpu_gflops > 0 ? cfg.gpu_gflops * 1e9 : cfg.gpu_mult * g_cap.cpu;
+    g_cap.gpu_share = g_cap.gpu_dev / g_cap.sharers;
+    g_cap.bw_dev = ginfo.mem_bw_gbs * 1e9 / 4.0;  // GEMV: 2 FLOP per 8-byte weight
+    g_cap.bw_share = g_cap.bw_dev / g_cap.sharers;
+    g_cap.sm = std::max(1, ginfo.sm_count);
+    g_cap.slot_limit = cfg.pack ? std::max(1, cfg.gpu_streams / g_cap.sharers) : 1;
+    size_t fb = 0, tb = 0;
+    if (gpu::mem_info(&fb, &tb) != gpu::OK) fb = (size_t)(ginfo.mem_gb * 1073741824.0);
+    g_cap.mem_share = 0.9 * (double)fb / g_cap.sharers;
+    precompute_gpu_costs();
+    st.cap_cpu = g_cap.cpu;
+    st.cap_gpu = g_cap.gpu_share;
+    st.slot_limit = g_cap.slot_limit;
+    st.sharers = g_cap.sharers;
+    LOG("GPU %d (%s, %.1f GB, %d SMs, %.0f GB/s) via %s, node-local rank %d, shared by %d "
+        "rank(s)", dev, ginfo.name, ginfo.mem_gb, ginfo.sm_count, ginfo.mem_bw_gbs,
+        gpu::backend(), local_rank, g_cap.sharers);
   }
 
   if (g_rank == 0) {
@@ -1455,6 +2340,34 @@ int main(int argc, char** argv) {
       std::printf(" (GPU iff task > %.3f TFLOP)", cfg.gpu_threshold * 1e-12);
     std::printf(": GPU-routed shapes  train %d/%d, infer %d/%d\n", ng[0], cfg.nshapes, ng[1],
                 cfg.nshapes);
+    if (g_gpu_ready) {
+      std::printf("        capacity: CPU %.2f GFLOP/s per process (%s); GPU %.1f GFLOP/s per "
+                  "device (%s); per rank %.1f GFLOP/s, %d stream(s); GEMV DRAM bound %.1f "
+                  "GFLOP/s\n",
+                  g_cap.cpu * 1e-9, cfg.cpu_gflops > 0 ? "given" : "calibrated",
+                  g_cap.gpu_dev * 1e-9,
+                  cfg.gpu_gflops > 0 ? "given" : (std::to_string((int)cfg.gpu_mult) + " x CPU").c_str(),
+                  g_cap.gpu_share * 1e-9, g_cap.slot_limit, g_cap.bw_dev * 1e-9);
+      for (int ty = 0; ty < 2; ++ty) {  // what the demand model says about the shapes
+        std::vector<double> d;
+        for (int i = 0; i < cfg.nshapes; ++i) d.push_back(g_cost[ty][i].demand);
+        std::sort(d.begin(), d.end());
+        double med = d[d.size() / 2];
+        double fit = g_cap.gpu_share / std::max(med, 1.0);
+        bool bw_bound = ty == INFER && g_cap.bw_share > 0 && g_cap.bw_share < g_cap.gpu_share;
+        if (bw_bound) fit = g_cap.bw_share / std::max(med, 1.0);
+        std::printf("        %s demand per task (GFLOP/s): min %.1f  median %.1f  max %.1f  -> "
+                    "~%.1f median tasks fit one rank's %s share\n",
+                    ty == TRAIN ? "train" : "infer", d.front() * 1e-9, med * 1e-9,
+                    d.back() * 1e-9, fit, bw_bound ? "DRAM-bandwidth" : "FLOP");
+      }
+      std::printf("        packing %s (max %d concurrent GPU jobs per rank)%s\n",
+                  cfg.pack ? "on" : "OFF", g_cap.slot_limit,
+                  cfg.exec_mode == EXEC_BOTH
+                      ? (cfg.spill ? "; CPU worker runs CPU-routed tasks concurrently; spill on"
+                                   : "; CPU worker runs CPU-routed tasks concurrently; spill off")
+                      : "");
+    }
     std::fflush(stdout);
   }
 
@@ -1477,7 +2390,8 @@ int main(int argc, char** argv) {
   sync_global_mix();
   sample_timeline(MPI_Wtime(), true);
 
-  run_loop();
+  if (g_concurrent) run_loop_concurrent();
+  else run_loop();
 
   sample_timeline(MPI_Wtime(), true);
   if (g_rank == 0) {
