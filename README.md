@@ -1,8 +1,8 @@
-# mpisim — MPI training/inference workload simulator
+# mpi-tisim — MPI training/inference workload simulator
 
 C++17 + MPI-3 simulator. Every rank runs an infinite self-scheduling loop that
-pulls tasks from a global counter (NXTVAL) and runs either a **training** task
-(DGEMM/DAXPY) or an **inference** task (DGEMV), until told to exit. Each task
+pulls tasks from a global task counter (NXTVAL) and runs either a **training** task
+(DGEMM+DAXPY) or an **inference** task (DGEMV), until told to exit. Each task
 runs on the CPU (OpenBLAS) or the GPU (cuBLAS), chosen by `exec_mode`. With a
 GPU in play, each rank packs several tasks onto the GPU on separate CUDA
 streams, up to the GPU's FLOP capacity, while its CPU runs its own task
