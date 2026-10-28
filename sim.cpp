@@ -4,8 +4,9 @@
 //  * Training task  : fixed #epochs of  fwd DGEMM, 2x bwd DGEMM (dW, dX), DAXPY
 //  * Inference task : batch of single-vector inputs through L layers
 //                     (DGEMV + bias + ReLU per layer)
-//  * 100 random shape combinations each (dimensions in the thousands, default
-//    [256, 4096])
+//  * ~100 shapes per task type (--nshapes): dimensions in [256, 4096] by
+//    default, or per type with shape_range=t:lo-hi;i:lo-hi, optionally
+//    restricted to powers of a base per dimension with shape_mode=t:b,n,k;i:k
 //  * CPU kernels: OpenBLAS (cblas_*).  GPU kernels: cuBLAS (gpu_kernels.cu).
 //    exec_mode:cpu | exec_mode:gpu | exec_mode:cpu,gpu  — with cpu,gpu every
 //    task whose precalculated total FLOPs exceed 1 TFLOP (--gpu-threshold)
@@ -29,6 +30,9 @@
 //      r:<rank>    resume rank (drain its checkpoints first)        r:all ok
 //      e:0         exit now, do NOT save checkpoints
 //      e:1         exit now, save checkpoints
+//      l:<pct>,<lo>-<hi>  a random <pct>% of the ranks use a NXTVAL incr drawn
+//                  from [lo,hi] per claim (see the count/next task loop);
+//                  l:off resets every rank to incr 1
 // ============================================================================
 #include <mpi.h>
 #include <cblas.h>
@@ -44,7 +48,9 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <array>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -66,7 +72,24 @@ extern "C" void openblas_set_num_threads(int) __attribute__((weak));
 enum ExecMode { EXEC_CPU = 1, EXEC_GPU = 2, EXEC_BOTH = 3 };
 static constexpr int DIM_CAP = 8192;
 
+// Per task type: dimension range and, per dimension, an optional base
+// ("power of base" values only; 0 = any integer in the range).
+//   training  dims {b, n, k}: X is b x k, W is k x n, Y is b x n
+//   inference dims {b, l}   : b = batch (single-vector inputs per task),
+//                             l = layer widths d[0..L]; separate ranges
+//                             (shape_range i:b,l), one shared base (shape_mode
+//                             i:k) because each layer's output feeds the next
+struct ShapeSpec {
+  // range per dimension group (-1: use --min-dim / --max-dim):
+  //   training [0] = b, n, k;  inference [0] = batch b, [1] = layer widths l
+  int lo[2] = {-1, -1}, hi[2] = {-1, -1};
+  int base[3] = {0, 0, 0};
+  bool mode_set = false;
+};
+
 struct Config {
+  ShapeSpec tspec, ispec;      // shape_range= / shape_mode=
+  bool print_shapes = false;   // --print-shapes: print the shape tables and exit
   int epochs = 40;             // training epochs per task
   int nshapes = 100;           // shape combinations per workload
   int min_dim = 256;           // random dims in [min_dim, max_dim]
@@ -152,18 +175,136 @@ struct InferShape { int batch, L; int d[MAXL + 1]; };  // layer l: d[l] -> d[l+1
 static std::vector<TrainShape> g_tshapes;
 static std::vector<InferShape> g_ishapes;
 
-static void make_shapes() {
-  std::mt19937_64 rng(cfg.seed);
-  std::uniform_int_distribution<int> dim(cfg.min_dim, cfg.max_dim);
-  std::uniform_int_distribution<int> lay(2, cfg.max_layers);
-  g_tshapes.resize(cfg.nshapes);
-  g_ishapes.resize(cfg.nshapes);
-  for (auto& s : g_tshapes) s = {dim(rng), dim(rng), dim(rng)};
-  for (auto& s : g_ishapes) {
-    s.batch = dim(rng);
-    s.L = lay(rng);
-    for (int l = 0; l <= s.L; ++l) s.d[l] = dim(rng);
+// ---- shape tables -----------------------------------------------------------
+// Candidate values of one dimension: every integer in [lo,hi], or only the
+// powers of `base` (base^0 = 1 included if lo <= 1) when base >= 2.
+struct DimSet {
+  int lo, hi, base;
+  std::vector<int> vals;  // explicit list for power-of-base dims
+  double count() const { return base ? (double)vals.size() : (double)(hi - lo + 1); }
+  int draw(std::mt19937_64& rng) const {
+    if (!base) return std::uniform_int_distribution<int>(lo, hi)(rng);
+    return vals[std::uniform_int_distribution<size_t>(0, vals.size() - 1)(rng)];
   }
+  int at(int64_t i) const { return base ? vals[(size_t)i] : lo + (int)i; }
+};
+static DimSet make_dimset(int lo, int hi, int base) {
+  DimSet d{lo, hi, base, {}};
+  if (base >= 2)
+    for (int64_t v = 1; v <= hi; v *= base)
+      if (v >= lo) d.vals.push_back((int)v);
+  return d;
+}
+static void spec_range(const ShapeSpec& sp, int g, int* lo, int* hi) {
+  *hi = sp.hi[g] > 0 ? sp.hi[g] : cfg.max_dim;
+  *lo = sp.lo[g] > 0 ? sp.lo[g] : (sp.hi[g] > 0 ? std::max(1, (sp.hi[g] + 15) / 16) : cfg.min_dim);
+}
+static std::string describe_dim(const DimSet& d) {
+  if (!d.base) return "[" + std::to_string(d.lo) + "," + std::to_string(d.hi) + "]";
+  std::string v;
+  for (int x : d.vals) v += (v.empty() ? "" : ",") + std::to_string(x);
+  return std::to_string(d.base) + "^k in [" + std::to_string(d.lo) + "," + std::to_string(d.hi) +
+         "] = {" + v + "}";
+}
+static std::string g_shape_desc[2];  // for the banner
+
+// Builds g_tshapes / g_ishapes (identical on every rank: seeded by --seed).
+// If a type has no more distinct combinations than --nshapes, all of them are
+// used; otherwise --nshapes distinct ones are sampled. Returns false (with a
+// message on rank 0) if a dimension has no admissible value.
+static bool make_shapes() {
+  std::mt19937_64 rng(cfg.seed);
+  int tlo, thi, blo, bhi, llo, lhi;
+  spec_range(cfg.tspec, 0, &tlo, &thi);
+  spec_range(cfg.ispec, 0, &blo, &bhi);  // inference batch
+  spec_range(cfg.ispec, 1, &llo, &lhi);  // inference layer widths
+  // training dims in draw order B, K, N (spec order is b, n, k)
+  DimSet tb = make_dimset(tlo, thi, cfg.tspec.base[0]);
+  DimSet tn = make_dimset(tlo, thi, cfg.tspec.base[1]);
+  DimSet tk = make_dimset(tlo, thi, cfg.tspec.base[2]);
+  DimSet im = make_dimset(blo, bhi, cfg.ispec.base[0]);
+  DimSet in = make_dimset(llo, lhi, cfg.ispec.base[1]);
+  struct Named { const DimSet* d; const char* what; };
+  for (Named x : {Named{&tb, "training b"}, Named{&tn, "training n"}, Named{&tk, "training k"},
+                  Named{&im, "inference b (batch)"}, Named{&in, "inference l (layer width)"}})
+    if (x.d->count() < 1) {
+      if (g_rank == 0)
+        std::fprintf(stderr, "shape_mode/shape_range: no power of %d lies in [%d,%d] for %s\n",
+                     x.d->base, x.d->lo, x.d->hi, x.what);
+      return false;
+    }
+  const size_t want = (size_t)cfg.nshapes;
+
+  // ---- training ----
+  g_tshapes.clear();
+  const double tcombos = tb.count() * tn.count() * tk.count();
+  if (tcombos <= (double)want) {  // few combinations: take them all
+    for (int64_t a = 0; a < (int64_t)tb.count(); ++a)
+      for (int64_t b = 0; b < (int64_t)tk.count(); ++b)
+        for (int64_t c = 0; c < (int64_t)tn.count(); ++c)
+          g_tshapes.push_back({tb.at(a), tk.at(b), tn.at(c)});
+    std::shuffle(g_tshapes.begin(), g_tshapes.end(), rng);
+  } else {
+    std::set<std::array<int, 3>> seen;
+    for (size_t tries = 0; g_tshapes.size() < want && tries < 1000 * want; ++tries) {
+      TrainShape t{tb.draw(rng), tk.draw(rng), tn.draw(rng)};
+      if (seen.insert({t.B, t.K, t.N}).second) g_tshapes.push_back(t);
+    }
+  }
+
+  // ---- inference: L in [2, max_layers], batch from m, every width from n ----
+  g_ishapes.clear();
+  double icombos = 0;
+  for (int L = 2; L <= cfg.max_layers; ++L) icombos += im.count() * std::pow(in.count(), L + 1);
+  std::uniform_int_distribution<int> lay(2, cfg.max_layers);
+  if (icombos <= (double)want) {
+    for (int L = 2; L <= cfg.max_layers; ++L)
+      for (int64_t a = 0; a < (int64_t)im.count(); ++a) {
+        const int64_t nw = (int64_t)std::llround(std::pow(in.count(), L + 1));
+        for (int64_t w = 0; w < nw; ++w) {
+          InferShape sh{};
+          sh.batch = im.at(a);
+          sh.L = L;
+          int64_t x = w;
+          for (int l = 0; l <= L; ++l, x /= (int64_t)in.count()) sh.d[l] = in.at(x % (int64_t)in.count());
+          g_ishapes.push_back(sh);
+        }
+      }
+    std::shuffle(g_ishapes.begin(), g_ishapes.end(), rng);
+  } else {
+    std::set<std::vector<int>> seen;
+    for (size_t tries = 0; g_ishapes.size() < want && tries < 1000 * want; ++tries) {
+      InferShape sh{};
+      sh.batch = im.draw(rng);
+      sh.L = lay(rng);
+      std::vector<int> key{sh.batch, sh.L};
+      for (int l = 0; l <= sh.L; ++l) key.push_back(sh.d[l] = in.draw(rng));
+      if (seen.insert(key).second) g_ishapes.push_back(sh);
+    }
+  }
+
+  // the CPU inference kernel sizes its work vectors with cfg.max_dim
+  int mx = 1;
+  for (auto& t : g_tshapes) mx = std::max({mx, t.B, t.K, t.N});
+  for (auto& sh : g_ishapes) {
+    mx = std::max(mx, sh.batch);
+    for (int l = 0; l <= sh.L; ++l) mx = std::max(mx, sh.d[l]);
+  }
+  cfg.max_dim = std::max(cfg.max_dim, mx);
+
+  char buf[64];
+  std::snprintf(buf, sizeof buf, "%zu shape(s)%s: ", g_tshapes.size(),
+                tcombos <= (double)want ? " (all combinations)" : "");
+  g_shape_desc[TRAIN] = std::string(buf) + "b " + describe_dim(tb) + ", n " + describe_dim(tn) +
+                        ", k " + describe_dim(tk);
+  std::snprintf(buf, sizeof buf, "%zu shape(s)%s: ", g_ishapes.size(),
+                icombos <= (double)want ? " (all combinations)" : "");
+  g_shape_desc[INFER] = std::string(buf) + "b (batch) " + describe_dim(im) + ", l (layer widths) " +
+                        describe_dim(in) + ", L in [2," + std::to_string(cfg.max_layers) + "]";
+  return true;
+}
+static int nshape(int type) {
+  return (int)(type == TRAIN ? g_tshapes.size() : g_ishapes.size());
 }
 static inline double train_epoch_flops(const TrainShape& s) {
   // fwd 2BKN + dW 2BKN + dX 2BKN + DAXPY 2KN
@@ -178,12 +319,12 @@ static inline double infer_sample_flops(const InferShape& s) {
 // Total FLOPs of a whole task of a given shape (precalculated, used for routing)
 static std::vector<double> g_task_flops[2];
 static void precompute_task_flops() {
-  g_task_flops[0].resize(cfg.nshapes);
-  g_task_flops[1].resize(cfg.nshapes);
-  for (int i = 0; i < cfg.nshapes; ++i) {
+  g_task_flops[0].resize(nshape(TRAIN));
+  g_task_flops[1].resize(nshape(INFER));
+  for (int i = 0; i < nshape(TRAIN); ++i)
     g_task_flops[0][i] = train_epoch_flops(g_tshapes[i]) * cfg.epochs;
+  for (int i = 0; i < nshape(INFER); ++i)
     g_task_flops[1][i] = infer_sample_flops(g_ishapes[i]) * g_ishapes[i].batch;
-  }
 }
 static bool g_gpu_ready = false;
 // Device routing: cpu -> CPU, gpu -> GPU, cpu,gpu -> GPU iff task FLOPs > threshold
@@ -232,7 +373,9 @@ enum Status { CONTINUE, COMPLETED, PREEMPTED, SUSPENDED, EXIT_SAVE, EXIT_NOSAVE,
   X(exec_gpu) X(t_gpu) X(gpu_fallbacks) X(gpu_dev)                           \
   X(t_busy) X(cap_cpu) X(cap_gpu) X(slot_limit) X(gpu_jobs) X(conc_int)       \
   X(max_conc) X(dem_int) X(spilled) X(sched_iters) X(sharers) X(t_cpu_occ)   \
-  X(rebalanced)
+  X(rebalanced) X(ids_claimed) X(blocks) X(max_block) X(wait_sum) X(wait_n)     \
+  X(wait_max) X(reserved_left) X(abandoned) X(prev_loaded) X(claim_lo) X(claim_hi) \
+  X(spin_iters) X(gap_sum) X(t_spin)
 
 struct Stats {
 #define DECL(n) double n = 0;
@@ -272,7 +415,9 @@ static double g_next_sample = 0.0;
 // ----------------------------------------------------------------------------
 // RMA window: global counters + published control state (lives on rank 0)
 // ----------------------------------------------------------------------------
+// control block at W_PRIO: [prio, exit, susp[np], claim_lo[np], claim_hi[np]]
 enum { W_NXT = 0, W_GTRAIN = 1, W_GINF = 2, W_VER = 3, W_PRIO = 4, W_EXIT = 5, W_SUSP0 = 6 };
+static int ctl_len() { return 2 + 3 * g_np; }
 static MPI_Win g_win;
 static int64_t* g_winbuf = nullptr;
 static constexpr double PRIO_SCALE = 1e9;
@@ -287,6 +432,7 @@ static double last_poll = -1e30;
 static double poll_s = 0.0005;
 static bool selftest_mode = false;
 static int64_t g_inf_seen = 0, g_train_seen = 0;  // last synced global mix
+static int64_t cur_llo = 1, cur_lhi = 1;           // this rank's NXTVAL claim range
 
 // Rank-0 side: state written by the monitor thread, read by the main thread
 struct CtlShared {
@@ -294,6 +440,8 @@ struct CtlShared {
   double p = 0.5;
   int64_t exit_mode = -1;
   std::vector<int64_t> susp;
+  std::vector<int64_t> llo, lhi;  // per-rank NXTVAL claim range
+  uint64_t lcount = 0;            // l: tokens applied (seeds the rank selection)
   std::atomic<uint64_t> version{0};
 };
 static CtlShared ctl;
@@ -313,10 +461,159 @@ static int64_t rma_read(int disp) {
   return res;
 }
 
-// NXTVAL: atomically fetch the global task counter and add 1
-static int64_t nxtval() {
+// ----------------------------------------------------------------------------
+// NXTVAL task loop (the classic "count / next" structure):
+//
+//   count = 1; next = NXTVAL(incr)        // NXTVAL returns old + incr
+//   while (...) {
+//     if (count >= next) {                // == when incr is 1 (see below)
+//       count = next; execute task #next; next = NXTVAL(incr);
+//     }
+//     count += incr;                      // incr may change at runtime (l:)
+//   }
+//
+// Every rank walks the global task index space with its local `count`, and
+// may only run the task whose index it claimed (`next`) once its walk reaches
+// it. Claims of other ranks therefore have to be walked past: a rank whose
+// incr is 1 waits (spins, without running a task) for as many loop iterations
+// as other ranks have advanced the counter since its last claim. A rank with
+// incr 50 pushes the counter 50 per claim, so the incr-1 ranks spin longer —
+// no artificial delay, just the loop itself.
+//
+// `count >= next` (with count aligned to next on a match) behaves exactly like
+// `count == next` for incr = 1, where count steps by one. With incr > 1, or an
+// incr that changes between claims, count moves in larger steps and could
+// jump past `next`; `==` would then never match again.
+//
+// Claimed-but-unstarted indices are part of the rank's checkpoint state: the
+// outstanding claim (one task) plus any left over from a previous run.
+// ----------------------------------------------------------------------------
+struct IdRange {
+  int64_t next, end;  // unstarted task ids [next, end)
+  double t_claim;
+};
+static std::deque<IdRange> g_reserved;  // claimed ids left over from a previous run
+static std::mt19937_64 g_lrng;          // separate stream: ranks with incr 1 are unaffected
+
+static int64_t g_count = 1;        // local walk over the task index space
+static int64_t g_next = 0;         // claimed task index (valid if g_have_claim)
+static int64_t g_incr = 1;         // incr of the current claim (walk step)
+static bool g_have_claim = false;
+static double g_claim_t = 0;
+
+static int64_t reserved_count() {
+  int64_t n = 0;
+  for (const IdRange& r : g_reserved) n += r.end - r.next;
+  return n;
+}
+// claimed but not started: leftovers + the outstanding claim
+static int64_t unstarted_count() { return reserved_count() + (g_have_claim ? 1 : 0); }
+
+// next = NXTVAL(incr): one task index per claim, the counter advances by incr
+static void claim() {
+  int64_t k = cur_llo;
+  if (cur_lhi > cur_llo) k = std::uniform_int_distribution<int64_t>(cur_llo, cur_lhi)(g_lrng);
   st.nxtval_calls++;
-  return rma_fetch_add(W_NXT, 1);
+  const int64_t old = rma_fetch_add(W_NXT, k);
+  g_incr = k;
+  g_next = old + k;
+  g_have_claim = true;
+  g_claim_t = MPI_Wtime();
+  st.ids_claimed += k;
+  if (k > 1) st.blocks++;
+  st.max_block = std::max(st.max_block, (double)k);
+  st.gap_sum += (double)std::max<int64_t>(0, g_next - g_count);
+}
+static bool walk_reached() { return g_have_claim && g_count >= g_next; }
+// the match: count = next, the claimed index becomes the task id
+static int64_t take_claim() {
+  g_count = g_next;
+  g_have_claim = false;
+  const double w = MPI_Wtime() - g_claim_t;
+  st.wait_sum += w;
+  st.wait_n++;
+  st.wait_max = std::max(st.wait_max, w);
+  return g_next;
+}
+static void walk_step() { g_count += g_incr; }  // count += incr
+
+static int64_t take_reserved_id() {
+  IdRange& r = g_reserved.front();
+  const int64_t id = r.next++;
+  if (r.next >= r.end) g_reserved.pop_front();
+  return id;
+}
+
+// The task type is decided once per acquisition and kept while the rank
+// waits for its walk to reach the claim (the decision is not redrawn).
+static int g_decision = -1;
+static int choose_type();
+static int decide_type() {
+  if (g_decision < 0) g_decision = choose_type();
+  return g_decision;
+}
+static void decision_used() { g_decision = -1; }
+
+// l:<pct>,<lo>-<hi> | l:off   (caller holds ctl.m)
+static bool apply_load_token(const std::string& tok, const std::string& v) {
+  if (v == "off") {
+    std::fill(ctl.llo.begin(), ctl.llo.end(), 1);
+    std::fill(ctl.lhi.begin(), ctl.lhi.end(), 1);
+    std::printf("[ctl] %s: every rank uses NXTVAL incr 1\n", tok.c_str());
+    std::fflush(stdout);
+    return true;
+  }
+  size_t comma = v.find(',');
+  if (comma == std::string::npos) {
+    std::fprintf(stderr, "[ctl] bad load token '%s' (l:<pct>,<lo>-<hi>, e.g. l:10,2-10)\n",
+                 tok.c_str());
+    return false;
+  }
+  std::string ps = v.substr(0, comma), rs = v.substr(comma + 1);
+  char* end = nullptr;
+  double pct = std::strtod(ps.c_str(), &end);
+  if (end == ps.c_str() || *end || !(pct >= 0.0 && pct <= 100.0)) {
+    std::fprintf(stderr, "[ctl] bad percentage in '%s' (need 0..100)\n", tok.c_str());
+    return false;
+  }
+  long long lo = 0, hi = 0;
+  size_t dash = rs.find('-');
+  std::string los = rs.substr(0, dash), his = dash == std::string::npos ? los : rs.substr(dash + 1);
+  lo = std::strtoll(los.c_str(), &end, 10);
+  bool ok = end != los.c_str() && !*end;
+  hi = std::strtoll(his.c_str(), &end, 10);
+  ok = ok && end != his.c_str() && !*end;
+  if (!ok || lo < 1 || hi < lo || hi > 1000000000LL) {
+    std::fprintf(stderr, "[ctl] bad range in '%s' (need <lo>-<hi> with 1 <= lo <= hi)\n",
+                 tok.c_str());
+    return false;
+  }
+  const long long n = std::llround(pct / 100.0 * g_np);
+  if (n <= 0) {
+    std::printf("[ctl] WARNING: %s selects %.4g%% of %d rank(s) = %.4g, which rounds to 0 "
+                "ranks; argument ignored\n", tok.c_str(), pct, g_np, pct / 100.0 * g_np);
+    std::fflush(stdout);
+    return false;
+  }
+  // a new l: token replaces the previous selection
+  std::vector<int> ranks(g_np);
+  for (int r = 0; r < g_np; ++r) ranks[r] = r;
+  std::mt19937_64 rng(cfg.seed ^ (0x9e3779b97f4a7c15ULL * ++ctl.lcount));
+  std::shuffle(ranks.begin(), ranks.end(), rng);
+  std::fill(ctl.llo.begin(), ctl.llo.end(), 1);
+  std::fill(ctl.lhi.begin(), ctl.lhi.end(), 1);
+  std::vector<int> sel(ranks.begin(), ranks.begin() + std::min<long long>(n, g_np));
+  std::sort(sel.begin(), sel.end());
+  std::string list;
+  for (int r : sel) {
+    ctl.llo[r] = lo;
+    ctl.lhi[r] = hi;
+    list += (list.empty() ? "" : ",") + std::to_string(r);
+  }
+  std::printf("[ctl] %s: %zu of %d rank(s) (%.4g%%) now use NXTVAL incr %lld-%lld: "
+              "rank(s) %s\n", tok.c_str(), sel.size(), g_np, pct, lo, hi, list.c_str());
+  std::fflush(stdout);
+  return true;
 }
 
 // Apply one control token (rank 0 monitor thread / initial argv)
@@ -354,6 +651,8 @@ static bool apply_token(const std::string& tok, bool quiet = false) {
     }
     ctl.exit_mode = (v == "1") ? 1 : 0;
     if (!quiet) LOG("[ctl] exit requested (%s checkpoints)", v == "1" ? "saving" : "NOT saving");
+  } else if (c == 'l') {
+    if (!apply_load_token(tok, v)) return false;
   } else {
     std::fprintf(stderr, "[ctl] unknown token '%s'\n", tok.c_str());
     return false;
@@ -362,13 +661,24 @@ static bool apply_token(const std::string& tok, bool quiet = false) {
   return true;
 }
 
+// Tokens are separated by whitespace or ';'. Commas also separate tokens
+// (p:0.9,s:1), except inside an l: token, whose value contains one.
 static void apply_line(const std::string& line) {
   std::string s = line;
   for (char& ch : s)
-    if (ch == ',' || ch == ';') ch = ' ';
+    if (ch == ';') ch = ' ';
   std::istringstream is(s);
   std::string tok;
-  while (is >> tok) apply_token(tok);
+  while (is >> tok) {
+    if (tok.rfind("l:", 0) == 0) {
+      apply_token(tok);
+      continue;
+    }
+    std::stringstream parts(tok);
+    std::string part;
+    while (std::getline(parts, part, ','))
+      if (!part.empty()) apply_token(part);
+  }
 }
 
 // Monitor thread (rank 0 only, never calls MPI): watches stdin and the
@@ -439,15 +749,19 @@ static void monitor_thread() {
 static void publish_if_needed() {
   uint64_t v = ctl.version.load();
   if (v == published_ver) return;
-  std::vector<int64_t> vals(2 + g_np);
+  std::vector<int64_t> vals(ctl_len());
   {
     std::lock_guard<std::mutex> lk(ctl.m);
     v = ctl.version.load();
     vals[0] = (int64_t)std::llround(ctl.p * PRIO_SCALE);
     vals[1] = ctl.exit_mode;
-    for (int r = 0; r < g_np; ++r) vals[2 + r] = ctl.susp[r];
+    for (int r = 0; r < g_np; ++r) {
+      vals[2 + r] = ctl.susp[r];
+      vals[2 + g_np + r] = ctl.llo[r];
+      vals[2 + 2 * g_np + r] = ctl.lhi[r];
+    }
   }
-  int n = 2 + g_np;
+  int n = ctl_len();
   MPI_Accumulate(vals.data(), n, MPI_INT64_T, 0, W_PRIO, n, MPI_INT64_T, MPI_REPLACE, g_win);
   MPI_Win_flush(0, g_win);
   int64_t vv = (int64_t)v;
@@ -463,7 +777,7 @@ static void poll_control() {
   if (g_rank == 0) publish_if_needed();
   int64_t ver = rma_read(W_VER);
   if (ver != seen_ver) {
-    int n = 2 + g_np;
+    int n = ctl_len();
     std::vector<int64_t> blk(n);
     MPI_Get_accumulate(nullptr, 0, MPI_INT64_T, blk.data(), n, MPI_INT64_T, 0, W_PRIO, n,
                        MPI_INT64_T, MPI_NO_OP, g_win);
@@ -476,6 +790,15 @@ static void poll_control() {
     cur_p = np_;
     cur_exit = blk[1];
     susp_me = blk[2 + g_rank] != 0;
+    int64_t lo = std::max<int64_t>(1, blk[2 + g_np + g_rank]);
+    int64_t hi = std::max<int64_t>(lo, blk[2 + 2 * g_np + g_rank]);
+    if (lo != cur_llo || hi != cur_lhi) {
+      if (hi > 1) LOG("load: this rank now uses NXTVAL incr %lld-%lld", (long long)lo,
+                      (long long)hi);
+      else LOG("load: this rank is back to NXTVAL incr 1");
+    }
+    cur_llo = lo;
+    cur_lhi = hi;
     seen_ver = ver;
   }
   last_poll = MPI_Wtime();
@@ -732,12 +1055,10 @@ static GpuCost infer_cost(const InferShape& s) {
 }
 
 static void precompute_gpu_costs() {
-  g_cost[TRAIN].resize(cfg.nshapes);
-  g_cost[INFER].resize(cfg.nshapes);
-  for (int i = 0; i < cfg.nshapes; ++i) {
-    g_cost[TRAIN][i] = train_cost(g_tshapes[i]);
-    g_cost[INFER][i] = infer_cost(g_ishapes[i]);
-  }
+  g_cost[TRAIN].resize(nshape(TRAIN));
+  g_cost[INFER].resize(nshape(INFER));
+  for (int i = 0; i < nshape(TRAIN); ++i) g_cost[TRAIN][i] = train_cost(g_tshapes[i]);
+  for (int i = 0; i < nshape(INFER); ++i) g_cost[INFER][i] = infer_cost(g_ishapes[i]);
 }
 
 // Calibrate the CPU FLOP rate of this process: single-threaded DGEMM.
@@ -924,14 +1245,31 @@ static Status run_task(Task& t, bool want_gpu, bool* on_gpu, int stop_at = -1) {
 // ----------------------------------------------------------------------------
 // Checkpoint files: one per rank, mirrors the rank's pending checkpoint queue
 // ----------------------------------------------------------------------------
-static const char CK_MAGIC[8] = {'S', 'I', 'M', 'C', 'K', 'P', 'T', '1'};
+// v2 = v1 + the rank's claimed-but-unstarted task id ranges after the records
+static const char CK_MAGIC_V1[8] = {'S', 'I', 'M', 'C', 'K', 'P', 'T', '1'};
+static const char CK_MAGIC_V2[8] = {'S', 'I', 'M', 'C', 'K', 'P', 'T', '2'};
+// v3 = v2 + a signature of the shape tables (shape_range/shape_mode/seed/...)
+static const char CK_MAGIC[8] = {'S', 'I', 'M', 'C', 'K', 'P', 'T', '3'};
+static uint64_t shape_signature() {
+  uint64_t h = 1469598103934665603ULL;
+  auto mix = [&](int64_t v) { h = (h ^ (uint64_t)v) * 1099511628211ULL; };
+  mix(nshape(TRAIN));
+  for (auto& t : g_tshapes) mix(t.B), mix(t.K), mix(t.N);
+  mix(nshape(INFER));
+  for (auto& sh : g_ishapes) {
+    mix(sh.batch), mix(sh.L);
+    for (int l = 0; l <= sh.L; ++l) mix(sh.d[l]);
+  }
+  return h;
+}
 static std::deque<Task> pending;
 
 static std::string ckpt_path(int rank) {
   return cfg.ckpt_dir + "/rank_" + std::to_string(rank) + ".ckpt";
 }
 
-static bool write_tasks(const std::string& path, const std::deque<Task>& q, double* bytes) {
+static bool write_tasks(const std::string& path, const std::deque<Task>& q, double* bytes,
+                        const std::deque<IdRange>* ranges = nullptr) {
   std::string tmp = path + ".tmp";
   FILE* f = std::fopen(tmp.c_str(), "wb");
   if (!f) {
@@ -943,9 +1281,11 @@ static bool write_tasks(const std::string& path, const std::deque<Task>& q, doub
   int32_t cnt = (int32_t)q.size();
   uint64_t seed = cfg.seed;
   int32_t ep = cfg.epochs;
+  uint64_t sig = shape_signature();
   W(CK_MAGIC, 8);
   W(&seed, 8);
   W(&ep, 4);
+  W(&sig, 8);
   W(&cnt, 4);
   for (const Task& t : q) {
     int32_t hdr[4] = {t.type, t.origin, t.shape, t.progress};
@@ -956,13 +1296,21 @@ static bool write_tasks(const std::string& path, const std::deque<Task>& q, doub
     W(&nw, 8);
     if (nw) W(t.W.data(), nw * sizeof(double));
   }
+  int32_t nr = ranges ? (int32_t)ranges->size() : 0;
+  W(&nr, 4);
+  for (int32_t i = 0; i < nr; ++i) {
+    const IdRange& r = (*ranges)[i];
+    int64_t se[2] = {r.next, r.end};
+    W(se, sizeof se);
+  }
   std::fclose(f);
   if (std::rename(tmp.c_str(), path.c_str()) != 0) return false;
   if (bytes) *bytes += nb;
   return true;
 }
 
-static bool read_tasks(const std::string& path, std::deque<Task>& q) {
+static bool read_tasks(const std::string& path, std::deque<Task>& q,
+                       std::deque<IdRange>* ranges = nullptr) {
   FILE* f = std::fopen(path.c_str(), "rb");
   if (!f) return false;
   bool ok = true;
@@ -973,8 +1321,18 @@ static bool read_tasks(const std::string& path, std::deque<Task>& q) {
   R(mg, 8);
   R(&seed, 8);
   R(&ep, 4);
+  const bool v3 = ok && std::memcmp(mg, CK_MAGIC, 8) == 0;
+  const bool v2 = v3 || (ok && std::memcmp(mg, CK_MAGIC_V2, 8) == 0);
+  uint64_t sig = 0;
+  if (v3) R(&sig, 8);
   R(&cnt, 4);
-  if (!ok || std::memcmp(mg, CK_MAGIC, 8) != 0) {
+  // records from a run with different shape tables would resume the wrong shapes
+  const bool other_shapes = v3 && sig != shape_signature();
+  if (other_shapes)
+    std::fprintf(stderr, "r%d: %s was written with different shape tables (shape_range / "
+                         "shape_mode / --nshapes / --seed); its %d task record(s) are dropped\n",
+                 g_rank, path.c_str(), cnt);
+  if (!ok || (!v2 && std::memcmp(mg, CK_MAGIC_V1, 8) != 0)) {
     std::fclose(f);
     std::fprintf(stderr, "r%d: %s is not a checkpoint file, ignored\n", g_rank, path.c_str());
     return false;
@@ -996,19 +1354,29 @@ static bool read_tasks(const std::string& path, std::deque<Task>& q) {
     if (nw) R(t.W.data(), nw * sizeof(double));
     if (!ok) break;
     // the record must fit the current shape table (seed / dims / nshapes may differ)
-    bool fits = (t.type == TRAIN || t.type == INFER) && t.shape >= 0 && t.shape < cfg.nshapes;
+    bool fits = (t.type == TRAIN || t.type == INFER) && t.shape >= 0 && t.shape < nshape(t.type);
     if (fits && t.type == TRAIN) {
       const TrainShape& s = g_tshapes[t.shape];
       fits = (nw == 0 || nw == (int64_t)s.K * s.N) && t.progress >= 0 && t.progress < cfg.epochs;
     } else if (fits) {
       fits = nw == 0 && t.progress >= 0 && t.progress < g_ishapes[t.shape].batch;
     }
+    if (other_shapes) continue;
     if (!fits) {
       std::fprintf(stderr, "r%d: %s: %s task %lld does not match the current shapes, dropped\n",
                    g_rank, path.c_str(), tname(t.type), (long long)t.id);
       continue;
     }
     q.push_back(std::move(t));
+  }
+  if (ok && v2) {
+    int32_t nr = 0;
+    R(&nr, 4);
+    for (int32_t i = 0; ok && i < nr; ++i) {
+      int64_t se[2];
+      R(se, sizeof se);
+      if (ok && ranges && se[1] > se[0] && se[0] >= 0) ranges->push_back({se[0], se[1], 0.0});
+    }
   }
   std::fclose(f);
   return ok;
@@ -1019,7 +1387,12 @@ static bool read_tasks(const std::string& path, std::deque<Task>& q) {
 // executed before the suspension is still credited when the task completes.
 static void reload_pending() {
   std::deque<Task> fromfile;
-  if (!read_tasks(ckpt_path(g_rank), fromfile)) return;
+  std::deque<IdRange> rfile;
+  if (!read_tasks(ckpt_path(g_rank), fromfile, &rfile)) return;
+  std::deque<IdRange> left;  // the outstanding claim stays the outstanding claim
+  for (IdRange& r : rfile)
+    if (!(g_have_claim && r.next == g_next && r.end == g_next + 1)) left.push_back(r);
+  g_reserved.swap(left);
   for (Task& t : fromfile)
     for (const Task& m : pending)
       if (m.id == t.id && m.type == t.type) {
@@ -1031,7 +1404,9 @@ static void reload_pending() {
 
 static void save_pending() {
   double t0 = MPI_Wtime();
-  if (write_tasks(ckpt_path(g_rank), pending, &st.ckpt_bytes)) st.ckpt_writes++;
+  std::deque<IdRange> ids = g_reserved;  // leftovers + the outstanding claim
+  if (g_have_claim) ids.push_back({g_next, g_next + 1, g_claim_t});
+  if (write_tasks(ckpt_path(g_rank), pending, &st.ckpt_bytes, &ids)) st.ckpt_writes++;
   st.t_ckpt += MPI_Wtime() - t0;
 }
 
@@ -1068,7 +1443,7 @@ static int choose_type() {
 }
 
 static int pick_shape(int type, int64_t id) {
-  return (int)(mix3(cfg.seed, (uint64_t)id, 7 + type) % (uint64_t)cfg.nshapes);
+  return (int)(mix3(cfg.seed, (uint64_t)id, 7 + type) % (uint64_t)nshape(type));
 }
 
 // ----------------------------------------------------------------------------
@@ -1090,7 +1465,7 @@ static double rel_diff(const Task& a, const Task& b) {
 // The cheapest task ids of a type (keeps the self test fast with large dims)
 static std::vector<int64_t> cheapest_ids(int type, int count) {
   std::vector<std::pair<double, int64_t>> c;
-  std::vector<bool> seen(cfg.nshapes, false);
+  std::vector<bool> seen(nshape(type), false);
   for (int64_t id = 0; id < 20000; ++id) {
     int sh = pick_shape(type, id);
     if (seen[sh]) continue;
@@ -1224,8 +1599,8 @@ static void run_loop() {
     if (cur_exit >= 0) {
       if (cur_exit == 1) {
         save_pending();
-        LOG("exit e:1 while idle/between tasks, %zu checkpoint(s) in %s", pending.size(),
-            ckpt_path(g_rank).c_str());
+        LOG("exit e:1 while idle/between tasks, %zu checkpoint(s) + %lld claimed id(s) in %s",
+            pending.size(), (long long)unstarted_count(), ckpt_path(g_rank).c_str());
       }
       break;
     }
@@ -1235,8 +1610,8 @@ static void run_loop() {
         was_susp = true;
         st.suspends++;
         save_pending();
-        LOG("SUSPENDED: %zu checkpoint(s) saved to %s", pending.size(),
-            ckpt_path(g_rank).c_str());
+        LOG("SUSPENDED: %zu checkpoint(s) + %lld claimed id(s) saved to %s", pending.size(),
+            (long long)unstarted_count(), ckpt_path(g_rank).c_str());
       }
       st.idle_loops++;
       double t0 = MPI_Wtime();
@@ -1248,12 +1623,14 @@ static void run_loop() {
       was_susp = false;
       st.resumes++;
       reload_pending();  // run exactly what was saved
+      if (g_have_claim) g_claim_t = MPI_Wtime();  // waiting is measured while active only
       drain = !pending.empty();
-      LOG("RESUMED: %zu checkpoint(s) to drain before new tasks", pending.size());
+      LOG("RESUMED: %zu checkpoint(s) + %lld claimed id(s) to drain before new tasks",
+          pending.size(), (long long)unstarted_count());
     }
 
     Task task;
-    bool resumed = false;
+    bool resumed = false, from_claim = false;
     double ts = MPI_Wtime();
     if (drain && !pending.empty()) {
       task = std::move(pending.front());
@@ -1261,16 +1638,33 @@ static void run_loop() {
       resumed = true;
     } else {
       drain = false;
-      int type = choose_type();
+      int type = decide_type();
       auto it = std::find_if(pending.begin(), pending.end(),
                              [&](const Task& t) { return t.type == type; });
       if (it != pending.end()) {
         task = std::move(*it);
         pending.erase(it);
         resumed = true;
+        decision_used();
       } else {
+        int64_t id;
+        if (!g_reserved.empty()) {  // ids claimed in a previous run go first
+          id = take_reserved_id();
+        } else {
+          if (!g_have_claim) claim();  // next = NXTVAL(incr)
+          if (!walk_reached()) {       // count < next: not this rank's turn yet
+            walk_step();               // count += incr
+            st.spin_iters++;
+            st.t_sched += MPI_Wtime() - ts;
+            st.t_spin += MPI_Wtime() - now;
+            continue;
+          }
+          id = take_claim();  // count = next
+          from_claim = true;
+        }
+        decision_used();
         task.type = type;
-        task.id = nxtval();
+        task.id = id;
         task.shape = pick_shape(type, task.id);
         const int64_t one = 1;
         MPI_Accumulate(&one, 1, MPI_INT64_T, 0,
@@ -1295,6 +1689,9 @@ static void run_loop() {
     st.task_runs++;
     bool on_gpu = false;
     Status s = run_task(task, route_to_gpu(task.type, task.shape), &on_gpu);
+    // after executing the claimed task: next = NXTVAL(incr); then count += incr
+    if (from_claim && s != EXIT_SAVE && s != EXIT_NOSAVE) claim();
+    walk_step();
 
     switch (s) {
       case COMPLETED:
@@ -1336,6 +1733,7 @@ static void run_loop() {
         break;
       case EXIT_NOSAVE:
         st.flops_discarded += task.flops_run;
+        st.abandoned++;
         LOG("exit e:0: %s task %lld (%s) abandoned at %d (no checkpoint)", tname(task.type),
             (long long)task.id, on_gpu ? "gpu" : "cpu", task.progress);
         break;
@@ -1348,6 +1746,9 @@ static void run_loop() {
   st.t_busy = st.t_train + st.t_infer;
   for (const Task& t : pending) st.flops_pending += t.flops_run;
   st.pending_left = (double)pending.size();
+  st.reserved_left = (double)unstarted_count();
+  st.claim_lo = (double)cur_llo;
+  st.claim_hi = (double)cur_lhi;
 }
 
 // ----------------------------------------------------------------------------
@@ -1412,6 +1813,7 @@ static void run_loop_concurrent() {
   g_cpu.th = std::thread(cpu_worker_main);
   const double t_loop0 = MPI_Wtime();
   double t_last = t_loop0;
+  bool was_walking = false;
 
   auto note_resumed = [&](const Task& t) {
     (t.type == TRAIN ? st.train_resumed : st.infer_resumed) += 1;
@@ -1436,7 +1838,7 @@ static void run_loop_concurrent() {
   // least that much capacity is still free
   double min_dem = INFINITY;
   for (int ty = 0; ty < 2; ++ty)
-    for (int i = 0; i < cfg.nshapes; ++i)
+    for (int i = 0; i < nshape(ty); ++i)
       if (route_to_gpu(ty, i) || (cfg.spill && cpu_slot))
         min_dem = std::min(min_dem, g_cost[ty][i].demand);
   auto gpu_room = [&] {
@@ -1589,6 +1991,7 @@ static void run_loop_concurrent() {
         break;
       case EXIT_NOSAVE:
         st.flops_discarded += task.flops_run;
+        st.abandoned++;
         LOG("exit e:0: %s task %lld (%s) abandoned at %d (no checkpoint)", tname(task.type),
             (long long)task.id, dev, task.progress);
         break;
@@ -1618,6 +2021,8 @@ static void run_loop_concurrent() {
     if (g_cpu.running) st.t_cpu_occ += dt;
     if (!jobs.empty() || g_cpu.running) st.t_busy += dt;
     else if (susp_me) st.t_idle += dt;
+    if (was_walking) st.t_spin += dt;
+    was_walking = false;
     sample_timeline(now);
     bool prog = false;
     if (now - last_poll >= poll_s) poll_control();
@@ -1698,7 +2103,8 @@ static void run_loop_concurrent() {
         if (cur_exit == 1) {
           unstage_all();
           save_pending();
-          LOG("exit e:1: %zu checkpoint(s) in %s", pending.size(), ckpt_path(g_rank).c_str());
+          LOG("exit e:1: %zu checkpoint(s) + %lld claimed id(s) in %s", pending.size(),
+              (long long)unstarted_count(), ckpt_path(g_rank).c_str());
         }
         break;
       }
@@ -1718,8 +2124,8 @@ static void run_loop_concurrent() {
         unstage_all();
         save_pending();
         dirty = false;
-        LOG("SUSPENDED: %zu checkpoint(s) saved to %s", pending.size(),
-            ckpt_path(g_rank).c_str());
+        LOG("SUSPENDED: %zu checkpoint(s) + %lld claimed id(s) saved to %s", pending.size(),
+            (long long)unstarted_count(), ckpt_path(g_rank).c_str());
       }
       st.idle_loops++;
       st.loops++;
@@ -1730,12 +2136,15 @@ static void run_loop_concurrent() {
       was_susp = false;
       st.resumes++;
       reload_pending();  // run exactly what was saved
+      if (g_have_claim) g_claim_t = MPI_Wtime();  // waiting is measured while active only
       drain = !pending.empty();
-      LOG("RESUMED: %zu checkpoint(s) to drain before new tasks", pending.size());
+      LOG("RESUMED: %zu checkpoint(s) + %lld claimed id(s) to drain before new tasks",
+          pending.size(), (long long)unstarted_count());
     }
 
     // ---- 6. fill free capacity ----
     double ts = MPI_Wtime();
+    bool walking = false;  // a resource is free but count < next
     for (int guard = 0; guard < 4 * gpu::MAX_SLOTS; ++guard) {
       gpu_waiting = false;
       aged = nullptr;
@@ -1778,16 +2187,31 @@ static void run_loop_concurrent() {
         x.from_drain = true;
         note_resumed(x.task);
       } else {
-        int type = choose_type();
+        int type = decide_type();
         auto it = std::find_if(pending.begin(), pending.end(),
                                [&](const Task& t) { return t.type == type; });
         if (it != pending.end()) {
           x.task = std::move(*it);
           pending.erase(it);
           note_resumed(x.task);
+          decision_used();
         } else {
+          int64_t id;
+          if (!g_reserved.empty()) {  // ids claimed in a previous run go first
+            id = take_reserved_id();
+          } else {
+            if (!g_have_claim) claim();  // next = NXTVAL(incr)
+            if (!walk_reached()) {       // count < next: walk on (one step per pass)
+              walking = true;
+              break;
+            }
+            id = take_claim();  // count = next; "execute" = start the task
+            claim();            // next = NXTVAL(incr)
+            walk_step();        // count += incr
+          }
+          decision_used();
           x.task.type = type;
-          x.task.id = nxtval();
+          x.task.id = id;
           x.task.shape = pick_shape(type, x.task.id);
           const int64_t one = 1;
           MPI_Accumulate(&one, 1, MPI_INT64_T, 0, type == TRAIN ? W_GTRAIN : W_GINF, 1,
@@ -1808,6 +2232,12 @@ static void run_loop_concurrent() {
       save_pending();
       dirty = false;
     }
+    if (walking) {  // one loop iteration of the walk: count += incr, no back-off
+      walk_step();
+      st.spin_iters++;
+      was_walking = true;
+      prog = true;
+    }
 
     if (!prog) std::this_thread::sleep_for(std::chrono::microseconds((int)cfg.gpu_poll_us));
   }
@@ -1815,6 +2245,10 @@ static void run_loop_concurrent() {
   st.wall = MPI_Wtime() - t_loop0;
   for (const Task& t : pending) st.flops_pending += t.flops_run;
   st.pending_left = (double)pending.size();
+  if (cur_exit == 0) st.abandoned += (double)staged.size();  // taken, never started
+  st.reserved_left = (double)unstarted_count();
+  st.claim_lo = (double)cur_llo;
+  st.claim_hi = (double)cur_lhi;
   {  // stop the CPU worker and merge its counters
     std::lock_guard<std::mutex> lk(g_cpu.m);
     g_cpu.quit = true;
@@ -1922,7 +2356,7 @@ static void report(const std::vector<double>& all, const std::vector<int>& tcoun
   static const char* mode_name[] = {"", "cpu", "gpu", "cpu,gpu"};
   std::printf("\n Device split  (exec_mode=%s", mode_name[cfg.exec_mode]);
   if (cfg.exec_mode == EXEC_BOTH)
-    std::printf(", tasks > %.3f TFLOP -> GPU", cfg.gpu_threshold * 1e-12);
+    std::printf(", tasks > %.4g TFLOP -> GPU", cfg.gpu_threshold * 1e-12);
   std::printf(")\n");
   std::printf(" rank | dev | train cpu/gpu | infer cpu/gpu |   train GFLOP cpu / gpu   |   infer "
               "GFLOP cpu / gpu   | GF/s cpu  GF/s gpu | gpu%%time fallbk\n");
@@ -2001,6 +2435,60 @@ static void report(const std::vector<double>& all, const std::vector<int>& tcoun
     if (std::strstr(gpu::backend(), "emulation"))
       std::printf("   NOTE: emulated device - 'achieved' is what the host thread(s) executing the "
                   "emulated GPU deliver, not a real GPU.\n");
+  }
+
+  // ---- NXTVAL task loop: claims, walking and waiting ----
+  {
+    bool any_incr = false;
+    for (auto& s : S) any_incr = any_incr || s.max_block > 1 || s.claim_hi > 1;
+    std::printf("\n NXTVAL task loop  (count/next walk; %s)\n",
+                any_incr ? "some ranks used incr > 1 via l:" : "every rank used incr = 1");
+    std::printf(" rank | incr now | claims | sum incr | incr mean  max | wait iters | gap mean | "
+                "claim->start ms mean / max | waiting %% | unstarted | done GFLOP\n");
+    std::printf("------+----------+--------+----------+----------------+------------+----------+"
+                "----------------------------+-----------+-----------+-----------\n");
+    double mx_done = 0, sum_done = 0, mx_incr = 0, mx_wait = 0;
+    for (int r = 0; r < g_np; ++r) {
+      const Stats& s = S[r];
+      char rng[24];
+      if (s.claim_hi > s.claim_lo) std::snprintf(rng, sizeof rng, "%.0f-%.0f", s.claim_lo, s.claim_hi);
+      else std::snprintf(rng, sizeof rng, "%.0f", s.claim_lo);
+      double done = G(s.flops_train + s.flops_infer);
+      mx_done = std::max(mx_done, done);
+      sum_done += done;
+      mx_incr = std::max(mx_incr, s.max_block);
+      mx_wait = std::max(mx_wait, s.wait_max);
+      std::printf(" %4d | %8s | %6.0f | %8.0f | %8.1f %5.0f | %10.0f | %8.1f | %12.3f / %-12.3f | "
+                  "%9.2f | %9.0f | %10.3f\n",
+                  r, rng, s.nxtval_calls, s.ids_claimed,
+                  s.nxtval_calls > 0 ? s.ids_claimed / s.nxtval_calls : 0.0, s.max_block,
+                  s.spin_iters, s.nxtval_calls > 0 ? s.gap_sum / s.nxtval_calls : 0.0,
+                  s.wait_n > 0 ? 1e3 * s.wait_sum / s.wait_n : 0.0, 1e3 * s.wait_max,
+                  100 * s.t_spin / std::max(s.wall, 1e-12), s.reserved_left, done);
+    }
+    std::printf("  all |    -     | %6.0f | %8.0f | %8.1f %5.0f | %10.0f | %8.1f | %12.3f / %-12.3f | "
+                "%9.2f | %9.0f | %10.3f\n",
+                T.nxtval_calls, T.ids_claimed,
+                T.nxtval_calls > 0 ? T.ids_claimed / T.nxtval_calls : 0.0, mx_incr, T.spin_iters,
+                T.nxtval_calls > 0 ? T.gap_sum / T.nxtval_calls : 0.0,
+                T.wait_n > 0 ? 1e3 * T.wait_sum / T.wait_n : 0.0, 1e3 * mx_wait,
+                100 * T.t_spin / std::max(T.wall, 1e-12), T.reserved_left, sum_done);
+    std::printf("   wait iters = loop iterations with count < next (no task runnable); gap = "
+                "next - count at claim time;\n   waiting %% = wall time spent in those "
+                "iterations. NXTVAL final value %lld = sum of incr over all claims: %s\n",
+                (long long)nxt, (double)nxt == T.ids_claimed ? "ok" : "MISMATCH");
+    const double mean_done = sum_done / g_np;
+    std::printf("   load imbalance: max/mean completed GFLOP per rank = %.3f  (1.000 = perfectly "
+                "even)\n", mean_done > 0 ? mx_done / mean_done : 0.0);
+    // every task handed out (one per claim, plus loaded from a previous run) is
+    // completed, held in the checkpoint queue, claimed-but-unstarted, or
+    // abandoned by e:0
+    const double in = T.nxtval_calls + T.prev_loaded;
+    const double out = T.train_done + T.infer_done + T.pending_left + T.reserved_left + T.abandoned;
+    std::printf("   task accounting: claims %.0f + loaded %.0f = completed %.0f + checkpoint queue "
+                "%.0f + claimed-unstarted %.0f + abandoned %.0f  -> %s\n",
+                T.nxtval_calls, T.prev_loaded, T.train_done + T.infer_done, T.pending_left,
+                T.reserved_left, T.abandoned, in == out ? "balanced" : "MISMATCH");
   }
 
   // ---- utilization over time: busy% per rank in 10 equal windows ----
@@ -2082,6 +2570,8 @@ static void usage() {
   std::printf(
       "usage: mpirun -np N ./mpisim [p:0.5] [s:R] ... [options]\n"
       "  control tokens : p:<0..1>  s:<rank|all>  r:<rank|all>  e:0  e:1\n"
+      "                   l:<pct>,<lo>-<hi>  a random <pct>%% of ranks use NXTVAL incr lo..hi,\n"
+      "                   drawn per claim (e.g. l:10,2-10  l:0.01,3-9); l:off: incr 1 again\n"
       "                   live: append to the control file (default sim_control.txt) or type on\n"
       "                   rank 0's stdin, e.g.  echo p:0.9 >> sim_control.txt\n"
       "  exec_mode:cpu | exec_mode:gpu | exec_mode:cpu,gpu      (cpu)\n"
@@ -2102,8 +2592,18 @@ static void usage() {
       "  --launch-us X     kernel launch cost in demand model   (5)\n"
       "  --unit-ms X       target duration of an inference GPU unit (20)\n"
       "  --max-wait-ms X   blocked GPU task age that stops backfilling (200)\n"
+      " shapes:\n"
+      "  shape_range=t:lo-hi;i:b,l     dimension ranges (either part optional; a range is\n"
+      "                    lo-hi or hi, hi alone -> lo = ceil(hi/16); default --min-dim..\n"
+      "                    --max-dim); inference b = batch range, l = layer-width range,\n"
+      "                    or one range i:lo-hi for both\n"
+      "  shape_mode=t:b,n,k;i:k        dimensions as powers of a base (>= 2), or * for any\n"
+      "                    integer; training b,n,k = batch, out, in features; inference\n"
+      "                    i:k = batch and layer widths powers of k (one base: each layer's\n"
+      "                    output is the next layer's input)  (quote the ';' in a shell)\n"
+      "  --print-shapes    print the shape tables and exit\n"
       "  --epochs N        training epochs per task            (40)\n"
-      "  --nshapes N       shape combinations per workload     (100)\n"
+      "  --nshapes N       shapes per task type; fewer if the combinations run out (100)\n"
       "  --min-dim N       smallest random dimension           (256)\n"
       "  --max-dim N       largest random dimension, <=8192    (4096)\n"
       "  --max-layers N    inference layers in [2,N], <=16     (8)\n"
@@ -2121,6 +2621,113 @@ static void usage() {
       "  --quiet | --verbose\n");
 }
 
+// shape_range=t:lo-hi;i:lo-hi   (either part optional; "t:hi" = default lo;
+//                                inference also i:b,l = batch range,width range)
+// shape_mode=t:b,n,k;i:k        (bases >= 2, or * for any integer)
+static std::vector<std::pair<char, std::string>> split_shape_arg(const std::string& v,
+                                                                 const char* what, bool* ok) {
+  std::vector<std::pair<char, std::string>> parts;
+  std::string t = v;
+  for (char& c : t)
+    if (c == ';' || c == ' ') c = '\n';
+  std::istringstream is(t);
+  std::string part;
+  while (std::getline(is, part)) {
+    if (part.empty()) continue;
+    if (part.size() < 3 || part[1] != ':' || (part[0] != 't' && part[0] != 'i')) {
+      if (g_rank == 0)
+        std::fprintf(stderr, "%s: bad part '%s' (expected t:... or i:...)\n", what, part.c_str());
+      *ok = false;
+      return parts;
+    }
+    parts.push_back({part[0], part.substr(2)});
+  }
+  if (parts.empty()) {
+    if (g_rank == 0) std::fprintf(stderr, "%s: empty value\n", what);
+    *ok = false;
+  }
+  return parts;
+}
+
+static bool parse_int(const std::string& x, long* out) {
+  char* end = nullptr;
+  *out = std::strtol(x.c_str(), &end, 10);
+  return !x.empty() && end != x.c_str() && !*end;
+}
+
+// one range: "hi" or "lo-hi"
+static bool parse_one_range(const std::string& r, long* lo, long* hi) {
+  *lo = -1;
+  size_t dash = r.find('-');
+  bool good = dash == std::string::npos
+                  ? parse_int(r, hi)
+                  : parse_int(r.substr(0, dash), lo) && parse_int(r.substr(dash + 1), hi);
+  return good && *hi >= 1 && *hi <= DIM_CAP && (dash == std::string::npos || (*lo >= 1 && *lo <= *hi));
+}
+
+// t:R          training b, n, k
+// i:R | i:B,L  inference: one range for batch and layer widths, or batch B and widths L
+static bool parse_shape_range(const std::string& v) {
+  bool ok = true;
+  for (auto& [ty, val] : split_shape_arg(v, "shape_range", &ok)) {
+    std::vector<std::string> rs;
+    std::stringstream ss(val);
+    std::string r;
+    while (std::getline(ss, r, ',')) rs.push_back(r);
+    long lo[2], hi[2];
+    bool good = !rs.empty() && rs.size() <= (ty == 'i' ? 2u : 1u);
+    for (size_t g = 0; good && g < rs.size(); ++g) good = parse_one_range(rs[g], &lo[g], &hi[g]);
+    if (!good) {
+      if (g_rank == 0)
+        std::fprintf(stderr, "shape_range: bad '%c:%s' (%s; each range hi or lo-hi with 1 <= lo "
+                             "<= hi <= %d)\n", ty, val.c_str(),
+                     ty == 't' ? "t:lo-hi" : "i:lo-hi, or i:b,l = batch range,layer-width range",
+                     DIM_CAP);
+      return false;
+    }
+    ShapeSpec& sp = ty == 't' ? cfg.tspec : cfg.ispec;
+    for (int g = 0; g < 2; ++g) {  // a single range applies to both inference groups
+      const size_t src = rs.size() == 2 ? (size_t)g : 0;
+      sp.lo[g] = (int)lo[src];
+      sp.hi[g] = (int)hi[src];
+    }
+  }
+  return ok;
+}
+
+static bool parse_shape_mode(const std::string& v) {
+  bool ok = true;
+  for (auto& [ty, val] : split_shape_arg(v, "shape_mode", &ok)) {
+    const size_t need = ty == 't' ? 3 : 1;  // t:b,n,k ; i:k
+    std::vector<int> bases;
+    std::stringstream ss(val);
+    std::string e;
+    while (std::getline(ss, e, ',')) {
+      long b = 0;
+      if (e == "*") bases.push_back(0);
+      else if (parse_int(e, &b) && b >= 2 && b <= DIM_CAP) bases.push_back((int)b);
+      else {
+        bases.clear();
+        break;
+      }
+    }
+    if (bases.size() != need) {
+      if (g_rank == 0)
+        std::fprintf(stderr, "shape_mode: bad '%c:%s' (%s; each a base >= 2, or * for any "
+                             "integer)\n", ty, val.c_str(),
+                     ty == 't' ? "t:b,n,k needs 3 values"
+                               : "i:k takes a single base for batch and layer widths, since "
+                                 "each layer's output is the next layer's input");
+      return false;
+    }
+    ShapeSpec& sp = ty == 't' ? cfg.tspec : cfg.ispec;
+    for (size_t i = 0; i < need; ++i) sp.base[i] = bases[i];
+    if (ty == 'i') sp.base[1] = bases[0];  // batch and layer widths share the base
+    sp.mode_set = true;
+  }
+  return ok;
+}
+
 static bool parse_args(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -2131,7 +2738,7 @@ static bool parse_args(int argc, char** argv) {
       }
       return argv[++i];
     };
-    if (a.size() >= 3 && a[1] == ':' && std::strchr("psre", a[0])) cfg.init_tokens.push_back(a);
+    if (a.size() >= 3 && a[1] == ':' && std::strchr("psrel", a[0])) cfg.init_tokens.push_back(a);
     else if (a.rfind("exec_mode", 0) == 0 || a == "--exec-mode") {
       // exec_mode:cpu,gpu | exec_mode=gpu | "exec_mode: cpu,gpu" | --exec-mode cpu
       std::string v;
@@ -2179,6 +2786,22 @@ static bool parse_args(int argc, char** argv) {
     else if (a == "--max-wait-ms") cfg.max_wait_ms = std::max(0.0, std::stod(next("--max-wait-ms")));
     else if (a == "--epochs") cfg.epochs = std::stoi(next("--epochs"));
     else if (a == "--nshapes") cfg.nshapes = std::stoi(next("--nshapes"));
+    else if (a.rfind("shape_range", 0) == 0 || a == "--shape-range" ||
+             a.rfind("shape_mode", 0) == 0 || a == "--shape-mode") {
+      // shape_range=VALUE | shape_range:VALUE | shape_range VALUE | --shape-range VALUE
+      const bool range = a.find("range") != std::string::npos;
+      const std::string key = range ? "shape_range" : "shape_mode";
+      std::string v;
+      if (a[0] == '-' || a == key) v = next(key.c_str());
+      else if (a.size() > key.size() && (a[key.size()] == '=' || a[key.size()] == ':'))
+        v = a.substr(key.size() + 1);
+      else {
+        if (g_rank == 0) std::fprintf(stderr, "unknown argument '%s' (try --help)\n", a.c_str());
+        return false;
+      }
+      if (!(range ? parse_shape_range(v) : parse_shape_mode(v))) return false;
+    }
+    else if (a == "--print-shapes") cfg.print_shapes = true;
     else if (a == "--min-dim") cfg.min_dim = std::stoi(next("--min-dim"));
     else if (a == "--max-dim") cfg.max_dim = std::stoi(next("--max-dim"));
     else if (a == "--max-layers") cfg.max_layers = std::stoi(next("--max-layers"));
@@ -2234,7 +2857,33 @@ int main(int argc, char** argv) {
   if (openblas_set_num_threads) openblas_set_num_threads(1);
   poll_s = cfg.poll_ms * 1e-3;
   g_rng.seed(cfg.seed ^ (0x5851f42d4c957f2dULL * (uint64_t)(g_rank + 1)));
-  make_shapes();
+  g_lrng.seed(cfg.seed ^ (0xd1342543de82ef95ULL * (uint64_t)(g_rank + 1)));
+  if (!make_shapes()) {
+    MPI_Finalize();
+    return 2;
+  }
+  if (cfg.print_shapes) {
+    if (g_rank == 0) {
+      std::printf("train %s\n", g_shape_desc[TRAIN].c_str());
+      std::printf("  %5s %6s %6s %6s %14s\n", "#", "b", "n", "k", "task GFLOP");
+      for (int i = 0; i < nshape(TRAIN); ++i) {
+        const TrainShape& t = g_tshapes[i];
+        std::printf("  %5d %6d %6d %6d %14.3f\n", i, t.B, t.N, t.K,
+                    train_epoch_flops(t) * cfg.epochs * 1e-9);
+      }
+      std::printf("infer %s\n", g_shape_desc[INFER].c_str());
+      std::printf("  %5s %6s %3s  %-40s %14s\n", "#", "m", "L", "widths d0..dL", "task GFLOP");
+      for (int i = 0; i < nshape(INFER); ++i) {
+        const InferShape& sh = g_ishapes[i];
+        std::string w;
+        for (int l = 0; l <= sh.L; ++l) w += (l ? "," : "") + std::to_string(sh.d[l]);
+        std::printf("  %5d %6d %3d  %-40s %14.3f\n", i, sh.batch, sh.L, w.c_str(),
+                    infer_sample_flops(sh) * sh.batch * 1e-9);
+      }
+    }
+    MPI_Finalize();
+    return 0;
+  }
   precompute_task_flops();
 
   // GPU setup: node-local rank picks device (local_rank % #devices)
@@ -2301,7 +2950,7 @@ int main(int argc, char** argv) {
   MPI_Barrier(MPI_COMM_WORLD);
 
   // RMA window: counters + control block on rank 0
-  const int nwin = W_SUSP0 + g_np;
+  const int nwin = W_PRIO + ctl_len();
   MPI_Win_allocate(g_rank == 0 ? nwin * sizeof(int64_t) : 0, sizeof(int64_t), MPI_INFO_NULL,
                    MPI_COMM_WORLD, &g_winbuf, &g_win);
   if (g_rank == 0) std::fill(g_winbuf, g_winbuf + nwin, 0);
@@ -2312,6 +2961,8 @@ int main(int argc, char** argv) {
   std::thread mon;
   if (g_rank == 0) {
     ctl.susp.assign(g_np, 0);
+    ctl.llo.assign(g_np, 1);
+    ctl.lhi.assign(g_np, 1);
     ctl.p = 0.5;
     ctl.version = 1;
     for (auto& t : cfg.init_tokens) apply_token(t, true);
@@ -2325,21 +2976,23 @@ int main(int argc, char** argv) {
     double tf = 0, inf = 0;
     for (auto& s : g_tshapes) tf += train_epoch_flops(s) * cfg.epochs;
     for (auto& s : g_ishapes) inf += infer_sample_flops(s) * s.batch;
-    std::printf("mpisim: %d ranks (MPI thread level %d), %d train + %d infer shapes, dims in "
-                "[%d,%d], %d epochs/task, p=%.3f\n", g_np, provided, cfg.nshapes, cfg.nshapes,
-                cfg.min_dim, cfg.max_dim, cfg.epochs, cur_p);
-    std::printf("        avg task size: train %.3f GFLOP, infer %.3f GFLOP; control file: %s%s\n",
-                tf / cfg.nshapes * 1e-9, inf / cfg.nshapes * 1e-9, cfg.ctl_file.c_str(),
+    std::printf("mpisim: %d ranks (MPI thread level %d), %d train + %d infer shapes, %d "
+                "epochs/task, p=%.3f\n", g_np, provided, nshape(TRAIN), nshape(INFER), cfg.epochs,
+                cur_p);
+    std::printf("        train %s\n        infer %s\n", g_shape_desc[TRAIN].c_str(),
+                g_shape_desc[INFER].c_str());
+    std::printf("        avg task size: train %.4g GFLOP, infer %.4g GFLOP; control file: %s%s\n",
+                tf / nshape(TRAIN) * 1e-9, inf / nshape(INFER) * 1e-9, cfg.ctl_file.c_str(),
                 cfg.use_stdin ? " (+ stdin)" : "");
     static const char* mode_name[] = {"", "cpu", "gpu", "cpu,gpu"};
     int ng[2] = {0, 0};
     for (int ty = 0; ty < 2; ++ty)
-      for (int i = 0; i < cfg.nshapes; ++i) ng[ty] += route_to_gpu(ty, i);
+      for (int i = 0; i < nshape(ty); ++i) ng[ty] += route_to_gpu(ty, i);
     std::printf("        exec_mode=%s", mode_name[cfg.exec_mode]);
     if (cfg.exec_mode == EXEC_BOTH)
-      std::printf(" (GPU iff task > %.3f TFLOP)", cfg.gpu_threshold * 1e-12);
-    std::printf(": GPU-routed shapes  train %d/%d, infer %d/%d\n", ng[0], cfg.nshapes, ng[1],
-                cfg.nshapes);
+      std::printf(" (GPU iff task > %.4g TFLOP)", cfg.gpu_threshold * 1e-12);
+    std::printf(": GPU-routed shapes  train %d/%d, infer %d/%d\n", ng[0], nshape(TRAIN), ng[1],
+                nshape(INFER));
     if (g_gpu_ready) {
       std::printf("        capacity: CPU %.2f GFLOP/s per process (%s); GPU %.1f GFLOP/s per "
                   "device (%s); per rank %.1f GFLOP/s, %d stream(s); GEMV DRAM bound %.1f "
@@ -2350,7 +3003,7 @@ int main(int argc, char** argv) {
                   g_cap.gpu_share * 1e-9, g_cap.slot_limit, g_cap.bw_dev * 1e-9);
       for (int ty = 0; ty < 2; ++ty) {  // what the demand model says about the shapes
         std::vector<double> d;
-        for (int i = 0; i < cfg.nshapes; ++i) d.push_back(g_cost[ty][i].demand);
+        for (int i = 0; i < nshape(ty); ++i) d.push_back(g_cost[ty][i].demand);
         std::sort(d.begin(), d.end());
         double med = d[d.size() / 2];
         double fit = g_cap.gpu_share / std::max(med, 1.0);
@@ -2374,10 +3027,13 @@ int main(int argc, char** argv) {
   // checkpoints left by a previous run (e:1 / suspension)
   if (cfg.fresh) {
     std::remove(ckpt_path(g_rank).c_str());
-  } else if (read_tasks(ckpt_path(g_rank), pending) && !pending.empty()) {
+  } else if (read_tasks(ckpt_path(g_rank), pending, &g_reserved) &&
+             (!pending.empty() || !g_reserved.empty())) {
     for (auto& t : pending) t.origin = ORIG_PREVRUN, t.flops_run = 0;
-    LOG("loaded %zu checkpoint(s) from %s, draining them first", pending.size(),
-        ckpt_path(g_rank).c_str());
+    for (auto& r : g_reserved) r.t_claim = MPI_Wtime();
+    st.prev_loaded = (double)pending.size() + (double)reserved_count();
+    LOG("loaded %zu checkpoint(s) + %lld claimed task id(s) from %s, draining them first",
+        pending.size(), (long long)unstarted_count(), ckpt_path(g_rank).c_str());
   }
 
   if (cfg.selftest && g_rank == 0) {

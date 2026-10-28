@@ -56,7 +56,7 @@ gpu_stub.o: gpu_stub.cpp gpu_kernels.h $(STAMP)
 	$(CXX) -O2 -std=c++17 -c gpu_stub.cpp -o $@
 
 clean:
-	rm -f mpisim *.o .build-* sim_timeline.csv
+	rm -f mpisim *.o .build-* sim_timeline.csv *.txt
 	rm -rf checkpoints
 
 .PHONY: clean

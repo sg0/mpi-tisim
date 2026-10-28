@@ -1,12 +1,40 @@
-# mpi-tisim — MPI training/inference workload simulator
+# mpisim — MPI training/inference workload simulator
 
 C++17 + MPI-3 simulator. Every rank runs an infinite self-scheduling loop that
-pulls tasks from a global task counter (NXTVAL) and runs either a **training** task
-(DGEMM+DAXPY) or an **inference** task (DGEMV), until told to exit. Each task
+pulls tasks from a global counter (NXTVAL) and runs either a **training** task
+(DGEMM/DAXPY) or an **inference** task (DGEMV), until told to exit. Each task
 runs on the CPU (OpenBLAS) or the GPU (cuBLAS), chosen by `exec_mode`. With a
 GPU in play, each rank packs several tasks onto the GPU on separate CUDA
 streams, up to the GPU's FLOP capacity, while its CPU runs its own task
 concurrently.
+
+Every rank distributes tasks with this loop:
+
+```
+count = 1; incr = 1
+next = NXTVAL(incr)        // atomic fetch-and-add on a global counter (starts at 0);
+                           // returns the new value, old + incr
+while (...) {
+  if (count >= next) {     // this rank's walk has reached the index it claimed
+    count = next
+    execute task #next
+    next = NXTVAL(incr)    // claim the next index
+  }
+  count += incr            // incr can change at runtime (l: control)
+}
+```
+
+Each rank walks the shared task index space with its local `count`. It may
+only run the task whose index it claimed, once its walk reaches it. Indices
+claimed by other ranks have to be walked past, so a rank sits in iterations
+with no task until it catches up. A rank whose incr is raised (e.g. to 50 via
+`l:`) moves the counter 50 per claim, which makes the incr-1 ranks wait longer
+— no artificial delay is added.
+
+The check is `>=` rather than `==`. For incr = 1 they behave identically,
+because count steps by one. With incr > 1, or an incr that changes, count can
+step past `next`, and `==` would never match again. Details are in
+[Task loop](#task-loop-count--next-and-uneven-load-with-l).
 
 | File | Role |
 |---|---|
@@ -28,6 +56,7 @@ mpirun -np 4 ./mpisim exec_mode:gpu                  # every task on the GPU
 mpirun -np 4 ./mpisim exec_mode:cpu,gpu --selftest   # route by task FLOPs, verify first
 mpirun -np 4 ./mpisim exec_mode:gpu --gpu-mult 250   # GPU = 250 x a CPU process
 mpirun -np 4 ./mpisim exec_mode:gpu --no-pack        # baseline: one task at a time per rank
+mpirun -np 4 ./mpisim "shape_mode=t:2,2,2;i:2" "shape_range=t:1024;i:256,4096"   # see Workloads
 ```
 
 The `EMU=1` build calls BLAS from the emulated device thread and the CPU worker
@@ -161,6 +190,8 @@ Live control from another terminal (same working directory):
 ./simctl.sh r:1      # resume rank 1    -> drains its checkpoints, then new tasks
 ./simctl.sh e:1      # exit, saving checkpoints
 ./simctl.sh e:0      # exit immediately, no checkpoints
+./simctl.sh l:10,2-10  # random 10% of ranks: NXTVAL incr drawn from 2..10 per claim
+./simctl.sh l:off      # every rank back to incr 1
 ```
 
 Tokens can also be typed on `mpirun`'s stdin (forwarded to rank 0), and
@@ -175,10 +206,65 @@ start; append with `>>`) and from stdin. That thread never calls MPI
 worker thread calls `MPI_Wtime`). Rank 0's main thread publishes the state into the RMA
 window, and every rank reads it with atomic RMA ops.
 
-## Workloads (100 random shapes each, dimensions in [256, 4096] by default)
+## Workloads and shape selection
 
-Use `--min-dim` and `--max-dim` to change the range (cap 8192), and
-`--nshapes` to change the number of shapes. At the defaults:
+Each task type has its own shape table of about `--nshapes` (100) shapes.
+Every task picks one shape from its type's table, chosen by its task index.
+By default every dimension is a random integer in [256, 4096] (`--min-dim`,
+`--max-dim`, cap 8192). Two startup arguments narrow this down:
+
+```bash
+mpirun -np 4 ./mpisim shape_range=t:100                      # training dims <= 100
+mpirun -np 4 ./mpisim "shape_range=t:16-512;i:64-2048"       # per-type lo-hi
+mpirun -np 4 ./mpisim "shape_range=i:16-64,256-1024"         # i:b,l = batch range, layer-width range
+mpirun -np 4 ./mpisim shape_range=t:100 shape_mode=t:2,2,2   # b, n, k powers of 2
+mpirun -np 4 ./mpisim "shape_mode=t:2,3,3;i:2"               # t: b pow 2, n,k pow 3; i: batch and layers pow 2
+./mpisim "shape_mode=t:2,2,*" shape_range=t:512 --print-shapes   # inspect the tables, then exit
+```
+
+**`shape_range=t:lo-hi;i:b,l`** sets the dimension ranges. Either part may be
+omitted; an omitted type keeps `--min-dim`..`--max-dim`. A range is `lo-hi`
+or just `hi`, in which case lo defaults to ceil(hi/16): `t:100` means
+[7, 100], the same 16× span as the default range.
+
+| form | meaning |
+|---|---|
+| `t:lo-hi` | training b, n and k all in this range |
+| `i:b,l` | inference batch in range `b`, layer widths d₀…d_L in range `l`, e.g. `i:16-64,256-1024` |
+| `i:lo-hi` | inference batch and layer widths both in this range |
+
+**`shape_mode=t:b,n,k;i:k`** restricts dimensions to powers of a base (≥ 2).
+`*` leaves a dimension as any integer in its range. Values are base^j inside
+the range, and 1 = base^0 is included when lo ≤ 1.
+
+| form | position | meaning |
+|---|---|---|
+| training `t:b,n,k` | b | batch (rows of X and Y, the GEMM *m*) |
+| | n | output features (columns of W and Y) |
+| | k | input features (columns of X, rows of W) |
+| inference `i:k` | k | batch and layer widths d₀…d_L (L random in [2, 8]) are all powers of k |
+
+Notes:
+
+* **Inference takes a single base.** One layer's output is the next layer's
+  input: layer l's output width is layer l+1's input width. So all layer
+  dimensions have to be powers of the same base, and `shape_mode` accepts
+  only one base for inference (`i:2` is valid, `i:3,4` is rejected). The
+  batch and the widths can still have different ranges, via
+  `shape_range=i:b,l`.
+* **Shape counts.** If a type has at most `--nshapes` distinct combinations,
+  all of them are used, e.g. `t:2,2,2` in [7,100] gives {8,16,32,64}³ = 64
+  shapes. Otherwise `--nshapes` distinct shapes are sampled. The banner and
+  `--print-shapes` show the candidate values and the table size.
+* **Errors.** A dimension with no admissible value (e.g. base 2 in [20,30])
+  and malformed values are reported at startup, and the run does not start.
+* **Quoting.** Quote arguments containing `;` in a shell.
+* **Checkpoints.** They record a signature of the shape tables (format v3).
+  Restarting with different `shape_range` / `shape_mode` / `--nshapes` /
+  `--seed` drops the old task records with a warning instead of resuming
+  them against different shapes. Claimed task ids are kept.
+
+At the defaults:
 
 * Average task size is ~2.3 TFLOP for training and ~95 GFLOP for inference.
 * About 63% of training shapes cross the 1 TFLOP threshold, and essentially
@@ -213,9 +299,90 @@ checkpointed and resumed task matches an uninterrupted one bit for bit.
   inference fraction, and `f_global` is synced from the window counters every
   `--sync-every` decisions. This keeps both the machine-wide mix and each
   rank's mix tracking `p`. `p=0` and `p=1` are exact.
+* **Task loop and `l:<pct>,<lo>-<hi>`:** see the next section.
 * All control reads and writes use accumulate-family atomics (`MPI_NO_OP` /
   `MPI_REPLACE`). The version field is written last, so a rank that sees a new
   version also sees the matching fields.
+
+## Task loop: `count` / `next` and uneven load with `l:`
+
+Every rank runs the classic NXTVAL loop:
+
+```
+count = 1; incr = 1
+next = NXTVAL(incr)            // fetch-and-add; returns old + incr (counter starts at 0)
+while (...) {
+  if (count >= next) {         // see note below
+    count = next
+    execute task #next
+    next = NXTVAL(incr)
+  }
+  count += incr                // incr can change at runtime (l:)
+}
+```
+
+Each rank walks the global task index space with its local `count`. It can
+only run the task whose index it claimed, once its walk reaches that index.
+Indices claimed by other ranks have to be walked past, one loop iteration per
+`incr`. So a rank whose incr is 1 sits in iterations with no runnable task
+until its count catches up with its claim. No delay is added; the waiting is
+just those iterations.
+
+**Why `>=` instead of `==`.** For incr = 1 the two behave identically: count
+steps by one, so it first reaches `next` with equality. With incr > 1, or an
+incr that changes between claims, count moves in bigger steps and can jump
+past `next`; with `==` the rank would never execute again. Setting
+`count = next` on a match keeps the walk exactly where `==` would have put it.
+
+**`l:<pct>,<lo>-<hi>`** sets incr for a random `<pct>`% of the ranks. `<pct>`
+may be fractional, e.g. `l:0.01,3-9`. A new incr is drawn uniformly from
+[lo, hi] for every claim.
+
+* **Selection:** the number of ranks is `round(pct/100 × np)`. If that is 0
+  (e.g. 10% of 4 ranks = 0.4), a warning goes to stdout and the token is
+  ignored. Malformed tokens are rejected on stderr.
+* **Replacement:** each new `l:` replaces the previous selection.
+  `l:off` sets every rank back to incr 1. The token also works at startup.
+
+A rank with incr 50 advances the counter by 50 per claim, which is one task.
+Every incr-1 rank then needs about 50 more iterations to reach its next claim.
+Measured on 4 ranks with small tasks (one rank's incr changed):
+
+| one rank's incr | incr-1 ranks waiting | mean gap walked | throughput |
+|---|---|---|---|
+| 1 | ~0.3% | 4 | 36.8 GFLOP/s |
+| 50 | 3–5% | ~55 | 35.1 GFLOP/s |
+| 500 | 33–92% | 1 100–51 000 | 17.4 GFLOP/s |
+
+A rank keeps up only if it walks (iterations per second) faster than the
+counter grows. If it is slower, its gap keeps growing and it rarely gets to
+run.
+
+**Checkpoint state.** Two kinds of claimed-but-unstarted indices are saved:
+the outstanding claim (`next`) and any leftovers from a previous run. They are
+saved on `s:R` and `e:1`, dropped on `e:0`. After a resume or restart,
+leftovers run before the rank claims again. The checkpoint format is v2,
+which adds these id ranges; v1 files still load.
+
+**In the concurrent engine** (`gpu`, `cpu,gpu`), each orchestrator iteration
+is one pass of the loop. "Execute" means starting the task on a free CPU or
+GPU slot. The walk steps only while a slot is free; otherwise the rank is
+busy, like a sequential rank in the middle of a task.
+
+The **NXTVAL task loop** table gives, per rank:
+
+* the current incr;
+* the number of claims, the sum of incr, and mean/max incr;
+* **wait iters** (iterations with `count < next`);
+* the mean gap walked per claim;
+* the **claim→start time** (mean and max);
+* **waiting %** of wall time;
+* unstarted claims and completed GFLOP.
+
+It also prints a max/mean load-imbalance factor, a check that NXTVAL's final
+value equals Σ incr, and exact task accounting:
+
+`claims + loaded from a previous run = completed + checkpoint queue + claimed-unstarted + abandoned (e:0)`
 
 ## Control semantics
 
