@@ -102,6 +102,7 @@ struct Config {
   std::string ckpt_dir = "checkpoints";
   std::string timeline_file = "sim_timeline.csv";
   bool fresh = false;          // ignore / delete checkpoints from a previous run
+  bool ckpt = true;            // --no-ckpt: no checkpoint files (partial work stays in memory)
   bool use_stdin = true;
   bool selftest = false;
   int sync_every = 8;          // decisions between global-mix syncs
@@ -1417,7 +1418,13 @@ static bool read_tasks(const std::string& path, std::deque<Task>& q,
 // On resume: replace the queue with what the checkpoint file holds, keeping
 // the in-memory per-run FLOP counters (not part of the file format) so work
 // executed before the suspension is still credited when the task completes.
+// Where checkpoints go, for log messages.
+static std::string ckpt_where() {
+  return cfg.ckpt ? ckpt_path(g_rank) : std::string("memory only (--no-ckpt)");
+}
+
 static void reload_pending() {
+  if (!cfg.ckpt) return;  // --no-ckpt: the in-memory queue is the checkpoint state
   std::deque<Task> fromfile;
   std::deque<IdRange> rfile;
   if (!read_tasks(ckpt_path(g_rank), fromfile, &rfile)) return;
@@ -1435,6 +1442,7 @@ static void reload_pending() {
 }
 
 static void save_pending() {
+  if (!cfg.ckpt) return;  // --no-ckpt: nothing is written
   double t0 = MPI_Wtime();
   std::deque<IdRange> ids = g_reserved;  // leftovers + the outstanding claim
   if (g_have_claim) ids.push_back({g_next, g_next + 1, g_claim_t});
@@ -1524,9 +1532,13 @@ static double split_run(int type, int64_t id, bool dev_a, bool dev_b, bool dev_c
   Status sb = run_task(b, dev_b, &g, half);
   bool gb = g;
   std::deque<Task> q{b}, q2;
-  write_tasks(path, q, nullptr);
-  read_tasks(path, q2);
-  std::remove(path.c_str());
+  if (cfg.ckpt) {  // round trip through a checkpoint file
+    write_tasks(path, q, nullptr);
+    read_tasks(path, q2);
+    std::remove(path.c_str());
+  } else {
+    q2 = q;  // --no-ckpt: in-memory hand-over only
+  }
   if (q2.empty()) { *ok = false; return INFINITY; }
   Task c = q2.front();
   Status sc = run_task(c, dev_c, &g);
@@ -1632,7 +1644,7 @@ static void run_loop() {
       if (cur_exit == 1) {
         save_pending();
         LOG("exit e:1 while idle/between tasks, %zu checkpoint(s) + %lld claimed id(s) in %s",
-            pending.size(), (long long)unstarted_count(), ckpt_path(g_rank).c_str());
+            pending.size(), (long long)unstarted_count(), ckpt_where().c_str());
       }
       break;
     }
@@ -1643,7 +1655,7 @@ static void run_loop() {
         st.suspends++;
         save_pending();
         LOG("SUSPENDED: %zu checkpoint(s) + %lld claimed id(s) saved to %s", pending.size(),
-            (long long)unstarted_count(), ckpt_path(g_rank).c_str());
+            (long long)unstarted_count(), ckpt_where().c_str());
       }
       st.idle_loops++;
       double t0 = MPI_Wtime();
@@ -2136,7 +2148,7 @@ static void run_loop_concurrent() {
           unstage_all();
           save_pending();
           LOG("exit e:1: %zu checkpoint(s) + %lld claimed id(s) in %s", pending.size(),
-              (long long)unstarted_count(), ckpt_path(g_rank).c_str());
+              (long long)unstarted_count(), ckpt_where().c_str());
         }
         break;
       }
@@ -2157,7 +2169,7 @@ static void run_loop_concurrent() {
         save_pending();
         dirty = false;
         LOG("SUSPENDED: %zu checkpoint(s) + %lld claimed id(s) saved to %s", pending.size(),
-            (long long)unstarted_count(), ckpt_path(g_rank).c_str());
+            (long long)unstarted_count(), ckpt_where().c_str());
       }
       st.idle_loops++;
       st.loops++;
@@ -2357,8 +2369,9 @@ static void report(const std::vector<double>& all, const std::vector<int>& tcoun
               "checksum %.6e)\n", G(T.flops_infer), T.infer_done, T.samples_run, T.checksum);
   std::printf("   executed (incl. partial work)  : train %.4f + infer %.4f GFLOP\n",
               G(T.exec_train), G(T.exec_infer));
-  std::printf("   partial work held in checkpoints: %.4f GFLOP in %.0f checkpoint(s)\n",
-              G(T.flops_pending), T.pending_left);
+  std::printf("   partial work held in checkpoints: %.4f GFLOP in %.0f checkpoint(s)%s\n",
+              G(T.flops_pending), T.pending_left,
+              cfg.ckpt ? "" : "  (memory only, --no-ckpt: not saved)");
   std::printf("   discarded by e:0                : %.4f GFLOP\n", G(T.flops_discarded));
   std::printf("   aggregate throughput            : %.3f GFLOP/s useful (completed) over wall, "
               "%.3f GFLOP/s per rank while busy\n",
@@ -2647,6 +2660,8 @@ static void usage() {
       "  --ckpt-dir DIR    checkpoint directory                (checkpoints)\n"
       "  --timeline FILE   per-rank timeline CSV               (sim_timeline.csv)\n"
       "  --fresh           discard checkpoints left by a previous run\n"
+      "  --no-ckpt         write no checkpoint files and load none; preempted / suspended\n"
+      "                    work stays in memory; e:1 then exits like e:0 (nothing saved)\n"
       "  --no-stdin        do not read control tokens from stdin\n"
       "  --sync-every N    decisions between global-mix syncs  (8)\n"
       "  --poll-ms X       control poll interval in kernels    (0.5)\n"
@@ -2880,6 +2895,7 @@ static bool parse_args(int argc, char** argv) {
     else if (a == "--ckpt-dir") cfg.ckpt_dir = next("--ckpt-dir");
     else if (a == "--timeline") cfg.timeline_file = next("--timeline");
     else if (a == "--fresh") cfg.fresh = true;
+    else if (a == "--no-ckpt") cfg.ckpt = false;
     else if (a == "--no-stdin") cfg.use_stdin = false;
     else if (a == "--sync-every") cfg.sync_every = std::max(1, std::stoi(next("--sync-every")));
     else if (a == "--poll-ms") cfg.poll_ms = std::stod(next("--poll-ms"));
@@ -3024,7 +3040,7 @@ int main(int argc, char** argv) {
   }
 
   if (g_rank == 0) {
-    mkdir(cfg.ckpt_dir.c_str(), 0755);
+    if (cfg.ckpt) mkdir(cfg.ckpt_dir.c_str(), 0755);
     FILE* f = std::fopen(cfg.ctl_file.c_str(), "w");  // start with an empty control file
     if (f) std::fclose(f);
   }
@@ -3067,6 +3083,10 @@ int main(int argc, char** argv) {
     std::printf("        avg task size: train %.4g GFLOP, infer %.4g GFLOP; control file: %s%s\n",
                 tf / nshape(TRAIN) * 1e-9, inf / nshape(INFER) * 1e-9, cfg.ctl_file.c_str(),
                 cfg.use_stdin ? " (+ stdin)" : "");
+    std::printf("        checkpoints: %s\n",
+                cfg.ckpt ? (cfg.ckpt_dir + "/rank_<r>.ckpt").c_str()
+                         : "disabled (--no-ckpt): nothing written or loaded; preempted / "
+                           "suspended work is kept in memory, e:1 saves nothing");
     static const char* mode_name[] = {"", "cpu", "gpu", "cpu,gpu"};
     int ng[2] = {0, 0};
     for (int ty = 0; ty < 2; ++ty)
@@ -3109,7 +3129,9 @@ int main(int argc, char** argv) {
   }
 
   // checkpoints left by a previous run (e:1 / suspension)
-  if (cfg.fresh) {
+  if (!cfg.ckpt) {
+    // --no-ckpt: files from earlier runs are neither loaded nor touched
+  } else if (cfg.fresh) {
     std::remove(ckpt_path(g_rank).c_str());
   } else if (read_tasks(ckpt_path(g_rank), pending, &g_reserved) &&
              (!pending.empty() || !g_reserved.empty())) {
@@ -3117,7 +3139,7 @@ int main(int argc, char** argv) {
     for (auto& r : g_reserved) r.t_claim = MPI_Wtime();
     st.prev_loaded = (double)pending.size() + (double)reserved_count();
     LOG("loaded %zu checkpoint(s) + %lld claimed task id(s) from %s, draining them first",
-        pending.size(), (long long)unstarted_count(), ckpt_path(g_rank).c_str());
+        pending.size(), (long long)unstarted_count(), ckpt_where().c_str());
   }
 
   if (cfg.selftest && g_rank == 0) {

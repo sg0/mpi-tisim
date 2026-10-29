@@ -57,6 +57,8 @@ mpirun -np 4 ./mpisim exec_mode:cpu,gpu --selftest   # route by task FLOPs, veri
 mpirun -np 4 ./mpisim exec_mode:gpu --gpu-mult 250   # GPU = 250 x a CPU process
 mpirun -np 4 ./mpisim exec_mode:gpu --no-pack        # baseline: one task at a time per rank
 mpirun -np 4 ./mpisim "shape_mode=t:2,2,2;i:2" "shape_range=t:1024;i:256,4096"   # see Workloads
+mpirun -np 4 ./mpisim --max-seconds 100 "shape_mode=t:2,2,2;i:2" "shape_range=t:32;i:8,32" --no-ckpt # disable
+checkpoints and run for fixed #seconds
 ```
 
 The `EMU=1` build calls BLAS from the emulated device thread and the CPU worker
@@ -436,6 +438,19 @@ means *all* running tasks of the rank: every GPU job and the CPU worker.
 
 Each rank's checkpoint file is rewritten atomically (tmp + rename) whenever
 its queue changes, so the file always matches the queue.
+
+**`--no-ckpt`** turns checkpoint files off; they are on by default. With it:
+
+* **Disk:** no checkpoint directory or file is created or written, and
+  checkpoints left by earlier runs are neither loaded nor touched.
+* **Same behaviour in memory:** priority preemption and `s:`/`r:` work as
+  usual. Interrupted tasks, together with their partial state and the
+  claimed task ids, are held in memory and resumed from there.
+* **Exit:** `e:1` still stops every task at a unit boundary, but nothing is
+  saved, so the next run starts from scratch. The report marks that queue
+  "memory only, --no-ckpt: not saved".
+* **Self test:** `--selftest` checks the hand-over in memory instead of
+  through a file.
 
 ## Report (additions for GPU)
 
