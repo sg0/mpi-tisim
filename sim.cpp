@@ -107,10 +107,15 @@ struct Config {
   int sync_every = 8;          // decisions between global-mix syncs
   double poll_ms = 0.5;        // control poll interval inside kernels
   double timeline_ms = 250.0;  // timeline sample interval
-  double max_seconds = 0.0;    // >0: inject e:1 after this many seconds
+  double max_seconds = 0.0;    // >0: exit with e:1 after this many seconds of task loop
   int verbose = 1;
   // ---- capacity model / packing (exec_mode gpu, cpu,gpu) ----
   double cpu_gflops = 0.0;     // CPU GFLOP/s per process (0 = calibrate at start)
+  // calibration DGEMM: m x n x k (single-threaded), repeated for >= calib_secs;
+  // calib_auto: use the median-FLOP training shape of the current table
+  int calib_m = 384, calib_n = 384, calib_k = 384;
+  bool calib_auto = false;
+  double calib_secs = 0.25;
   double gpu_mult = 100.0;     // GPU FLOP/s = gpu_mult x CPU FLOP/s per process
   double gpu_gflops = 0.0;     // >0: absolute GPU GFLOP/s per device (overrides mult)
   int gpu_streams = 16;        // max concurrent streams (jobs) per device
@@ -131,10 +136,17 @@ static Config cfg;
 static int g_rank = 0, g_np = 1;
 static double g_t0 = 0.0;
 
+// Log timestamps use std::chrono, not MPI_Wtime: LOG is also called from the
+// monitor thread, which must not make MPI calls (MPI_THREAD_FUNNELED).
+static std::chrono::steady_clock::time_point g_log_t0 = std::chrono::steady_clock::now();
+static double log_secs() {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_log_t0).count();
+}
+
 #define LOG(...)                                                       \
   do {                                                                 \
     if (cfg.verbose) {                                                 \
-      std::printf("[%9.3fs r%-3d] ", MPI_Wtime() - g_t0, g_rank);      \
+      std::printf("[%9.3fs r%-3d] ", log_secs(), g_rank);              \
       std::printf(__VA_ARGS__);                                        \
       std::printf("\n");                                               \
       std::fflush(stdout);                                             \
@@ -431,6 +443,12 @@ static int64_t seen_ver = -1;
 static double last_poll = -1e30;
 static double poll_s = 0.0005;
 static bool selftest_mode = false;
+// --max-seconds: every rank measures from the start of the task loop (set
+// right after a barrier) and switches itself to e:1 when the time is up. This
+// does not depend on rank 0 publishing anything, so a long task on rank 0
+// cannot delay the other ranks' exit.
+static double g_run_t0 = -1.0;
+static bool g_deadline_hit = false;
 static int64_t g_inf_seen = 0, g_train_seen = 0;  // last synced global mix
 static int64_t cur_llo = 1, cur_lhi = 1;           // this rank's NXTVAL claim range
 
@@ -689,8 +707,6 @@ static void monitor_thread() {
   bool stdin_ok = cfg.use_stdin;
   std::string sbuf;
   off_t off = 0;
-  double start = MPI_Wtime();
-  bool timed_exit = false;
   while (!monitor_stop.load()) {
     if (stdin_ok) {
       struct pollfd pfd{0, POLLIN, 0};
@@ -734,11 +750,6 @@ static void monitor_thread() {
           }
         }
       }
-    }
-    if (cfg.max_seconds > 0 && !timed_exit && MPI_Wtime() - start > cfg.max_seconds) {
-      timed_exit = true;
-      LOG("[ctl] --max-seconds reached, injecting e:1");
-      apply_token("e:1", true);
     }
   }
 }
@@ -801,6 +812,13 @@ static void poll_control() {
     cur_lhi = hi;
     seen_ver = ver;
   }
+  if (cfg.max_seconds > 0 && g_run_t0 >= 0 && !g_deadline_hit &&
+      MPI_Wtime() - g_run_t0 >= cfg.max_seconds) {
+    g_deadline_hit = true;
+    if (g_rank == 0)
+      LOG("[ctl] --max-seconds %g reached: exit e:1 (saving checkpoints)", cfg.max_seconds);
+  }
+  if (g_deadline_hit && cur_exit < 0) cur_exit = 1;  // e:0 published earlier still wins
   last_poll = MPI_Wtime();
   st.t_ctl += last_poll - t0;
 }
@@ -1062,23 +1080,37 @@ static void precompute_gpu_costs() {
 }
 
 // Calibrate the CPU FLOP rate of this process: single-threaded DGEMM.
+// Calibrate the CPU FLOP rate of this process: single-threaded DGEMM of
+// --calib-dgemm size (default 384^3), repeated for at least --calib-secs.
+static std::string g_calib_desc;
 static double calibrate_cpu_flops() {
-  const int n = 384;
-  std::vector<double> A((size_t)n * n), B((size_t)n * n), C((size_t)n * n);
+  int m = cfg.calib_m, n = cfg.calib_n, k = cfg.calib_k;
+  if (cfg.calib_auto) {  // the median-FLOP training shape: Y(BxN) = X(BxK) W(KxN)
+    std::vector<std::pair<double, int>> f;
+    for (int i = 0; i < nshape(TRAIN); ++i) f.push_back({train_epoch_flops(g_tshapes[i]), i});
+    std::sort(f.begin(), f.end());
+    const TrainShape& t = g_tshapes[f[f.size() / 2].second];
+    m = t.B, n = t.N, k = t.K;
+  }
+  std::vector<double> A((size_t)m * k), B((size_t)k * n), C((size_t)m * n);
   fill_uniform(A.data(), A.size(), 1, 1.0);
   fill_uniform(B.data(), B.size(), 2, 1.0);
-  cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, n, n, 1.0, A.data(), n, B.data(), n,
+  cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0, A.data(), k, B.data(), n,
               0.0, C.data(), n);  // warm-up
   int reps = 0;
   double t0 = MPI_Wtime(), t = 0;
   do {
-    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, n, n, 1.0, A.data(), n, B.data(),
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1.0, A.data(), k, B.data(),
                 n, 0.0, C.data(), n);
     ++reps;
     t = MPI_Wtime() - t0;
-  } while (t < 0.25);
+  } while (t < cfg.calib_secs);
   g_sink += C[0];
-  return 2.0 * n * n * n * reps / t;
+  char buf[96];
+  std::snprintf(buf, sizeof buf, "DGEMM %dx%dx%d%s, %d rep(s) in %.2f s", m, n, k,
+                cfg.calib_auto ? " (median training shape)" : "", reps, t);
+  g_calib_desc = buf;
+  return 2.0 * m * n * k * reps / t;
 }
 
 // ----------------------------------------------------------------------------
@@ -2580,6 +2612,9 @@ static void usage() {
       "  --gpu-threshold F FLOPs per task above which cpu,gpu uses the GPU   (1e12)\n"
       " capacity model / packing (exec_mode gpu, cpu,gpu):\n"
       "  --cpu-gflops X    CPU GFLOP/s per process             (0 = calibrate)\n"
+      "  --calib-dgemm D   calibration DGEMM: N (NxNxN), MxNxK, or auto = median\n"
+      "                    training shape                      (384)\n"
+      "  --calib-secs S    repeat the calibration DGEMM for at least S seconds (0.25)\n"
       "  --gpu-mult X      GPU GFLOP/s = X * CPU GFLOP/s       (100)\n"
       "  --gpu-gflops X    absolute GPU GFLOP/s per device     (overrides --gpu-mult)\n"
       "  --gpu-streams N   max concurrent streams per device   (16, shared by its ranks)\n"
@@ -2616,7 +2651,8 @@ static void usage() {
       "  --sync-every N    decisions between global-mix syncs  (8)\n"
       "  --poll-ms X       control poll interval in kernels    (0.5)\n"
       "  --timeline-ms X   timeline sample interval            (250)\n"
-      "  --max-seconds T   inject e:1 after T seconds          (0 = never)\n"
+      "  --max-seconds T   exit with e:1 after T seconds of simulation, counted from\n"
+      "                    the start of the task loop on every rank (0 = never)\n"
       "  --selftest        verify checkpoint/resume (and CPU<->GPU agreement), then run\n"
       "  --quiet | --verbose\n");
 }
@@ -2770,6 +2806,40 @@ static bool parse_args(int argc, char** argv) {
     }
     else if (a == "--gpu-threshold") cfg.gpu_threshold = std::stod(next("--gpu-threshold"));
     else if (a == "--cpu-gflops") cfg.cpu_gflops = std::stod(next("--cpu-gflops"));
+    else if (a == "--calib-dgemm") {  // N | MxNxK | auto
+      std::string v = next("--calib-dgemm");
+      long d[3] = {0, 0, 0};
+      int nd = 0;
+      bool good = true;
+      if (v == "auto") {
+        cfg.calib_auto = true;
+      } else {
+        std::stringstream ss(v);
+        std::string e;
+        while (good && std::getline(ss, e, 'x'))
+          good = nd < 3 && parse_int(e, &d[nd++]) && d[nd - 1] >= 1 && d[nd - 1] <= DIM_CAP;
+        good = good && (nd == 1 || nd == 3);
+        if (good) {
+          cfg.calib_m = (int)d[0];
+          cfg.calib_n = (int)(nd == 3 ? d[1] : d[0]);
+          cfg.calib_k = (int)(nd == 3 ? d[2] : d[0]);
+          cfg.calib_auto = false;
+        }
+      }
+      if (!good) {
+        if (g_rank == 0)
+          std::fprintf(stderr, "--calib-dgemm: bad '%s' (N, MxNxK or auto; dims 1..%d)\n",
+                       v.c_str(), DIM_CAP);
+        return false;
+      }
+    }
+    else if (a == "--calib-secs") {
+      cfg.calib_secs = std::stod(next("--calib-secs"));
+      if (!(cfg.calib_secs > 0 && cfg.calib_secs <= 60)) {
+        if (g_rank == 0) std::fprintf(stderr, "--calib-secs: need 0 < S <= 60\n");
+        return false;
+      }
+    }
     else if (a == "--gpu-mult") cfg.gpu_mult = std::stod(next("--gpu-mult"));
     else if (a == "--gpu-gflops") cfg.gpu_gflops = std::stod(next("--gpu-gflops"));
     else if (a == "--gpu-streams")
@@ -2835,6 +2905,15 @@ static bool parse_args(int argc, char** argv) {
 }
 
 // ----------------------------------------------------------------------------
+// MPI thread levels are implementation-defined integers: name them.
+static const char* thread_level_name(int lvl) {
+  if (lvl == MPI_THREAD_SINGLE) return "MPI_THREAD_SINGLE";
+  if (lvl == MPI_THREAD_FUNNELED) return "MPI_THREAD_FUNNELED";
+  if (lvl == MPI_THREAD_SERIALIZED) return "MPI_THREAD_SERIALIZED";
+  if (lvl == MPI_THREAD_MULTIPLE) return "MPI_THREAD_MULTIPLE";
+  return "unknown MPI thread level";
+}
+
 int main(int argc, char** argv) {
   int provided = 0;
   // Only the main thread calls MPI; the monitor thread is MPI-free.
@@ -2844,11 +2923,13 @@ int main(int argc, char** argv) {
   bool want_mt = false;
   for (int i = 1; i < argc; ++i)
     if (std::strstr(argv[i], "gpu") && std::strncmp(argv[i], "--gpu", 5) != 0) want_mt = true;
-  MPI_Init_thread(&argc, &argv, want_mt ? MPI_THREAD_MULTIPLE : MPI_THREAD_FUNNELED, &provided);
+  const int requested = want_mt ? MPI_THREAD_MULTIPLE : MPI_THREAD_FUNNELED;
+  MPI_Init_thread(&argc, &argv, requested, &provided);
   MPI_Comm_rank(MPI_COMM_WORLD, &g_rank);
   MPI_Comm_size(MPI_COMM_WORLD, &g_np);
   g_t0 = MPI_Wtime();
   MPI_Bcast(&g_t0, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+  g_log_t0 = std::chrono::steady_clock::now();  // all ranks pass the Bcast together
 
   if (!parse_args(argc, argv)) {
     MPI_Finalize();
@@ -2976,9 +3057,11 @@ int main(int argc, char** argv) {
     double tf = 0, inf = 0;
     for (auto& s : g_tshapes) tf += train_epoch_flops(s) * cfg.epochs;
     for (auto& s : g_ishapes) inf += infer_sample_flops(s) * s.batch;
-    std::printf("mpisim: %d ranks (MPI thread level %d), %d train + %d infer shapes, %d "
-                "epochs/task, p=%.3f\n", g_np, provided, nshape(TRAIN), nshape(INFER), cfg.epochs,
-                cur_p);
+    std::string lvl = thread_level_name(provided);
+    if (provided < requested)
+      lvl += std::string(", requested ") + thread_level_name(requested);
+    std::printf("mpisim: %d ranks (%s), %d train + %d infer shapes, %d epochs/task, p=%.3f\n",
+                g_np, lvl.c_str(), nshape(TRAIN), nshape(INFER), cfg.epochs, cur_p);
     std::printf("        train %s\n        infer %s\n", g_shape_desc[TRAIN].c_str(),
                 g_shape_desc[INFER].c_str());
     std::printf("        avg task size: train %.4g GFLOP, infer %.4g GFLOP; control file: %s%s\n",
@@ -2997,7 +3080,8 @@ int main(int argc, char** argv) {
       std::printf("        capacity: CPU %.2f GFLOP/s per process (%s); GPU %.1f GFLOP/s per "
                   "device (%s); per rank %.1f GFLOP/s, %d stream(s); GEMV DRAM bound %.1f "
                   "GFLOP/s\n",
-                  g_cap.cpu * 1e-9, cfg.cpu_gflops > 0 ? "given" : "calibrated",
+                  g_cap.cpu * 1e-9,
+                  cfg.cpu_gflops > 0 ? "given" : ("calibrated: " + g_calib_desc + ", mean over ranks").c_str(),
                   g_cap.gpu_dev * 1e-9,
                   cfg.gpu_gflops > 0 ? "given" : (std::to_string((int)cfg.gpu_mult) + " x CPU").c_str(),
                   g_cap.gpu_share * 1e-9, g_cap.slot_limit, g_cap.bw_dev * 1e-9);
@@ -3043,6 +3127,7 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
   }
   MPI_Barrier(MPI_COMM_WORLD);
+  g_run_t0 = MPI_Wtime();  // --max-seconds counts from here (setup / self test excluded)
   sync_global_mix();
   sample_timeline(MPI_Wtime(), true);
 

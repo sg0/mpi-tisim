@@ -1,4 +1,4 @@
-# mpisim — MPI training/inference workload simulator
+# mpi-tisim — MPI training/inference workload simulator
 
 C++17 + MPI-3 simulator. Every rank runs an infinite self-scheduling loop that
 pulls tasks from a global counter (NXTVAL) and runs either a **training** task
@@ -118,10 +118,27 @@ a CPU checkpoint holds.
 ## GPU capacity and packing (exec_mode `gpu`, `cpu,gpu`)
 
 **Capacity.** GPU FLOP/s per device = `--gpu-mult` (100) × the CPU FLOP/s of
-one process. The CPU rate is calibrated at startup with a single-threaded
-DGEMM, averaged over ranks, or set with `--cpu-gflops`; `--gpu-gflops` sets an
-absolute value instead. Ranks on the same node that map to the same device
-split its capacity, streams (`--gpu-streams`, 16 per device), and free memory.
+one process. `--gpu-gflops` sets an absolute GPU value instead. Ranks on the
+same node that map to the same device split its capacity, streams
+(`--gpu-streams`, 16 per device), and free memory.
+
+The CPU rate is measured at startup: each rank runs a single-threaded DGEMM
+repeatedly, and the result is averaged over ranks. `--cpu-gflops X` skips the
+measurement and uses X GFLOP/s.
+
+| option | meaning | default |
+|---|---|---|
+| `--calib-dgemm N` | N×N×N DGEMM | `384` |
+| `--calib-dgemm MxNxK` | M×N×K DGEMM, e.g. `64x2048x128` | |
+| `--calib-dgemm auto` | the median-FLOP shape of the current training table (follows `shape_range` / `shape_mode`) | |
+| `--calib-secs S` | repeat the DGEMM for at least S seconds (0 < S ≤ 60) | `0.25` |
+
+The single-thread DGEMM rate depends on the size, so a calibration shape
+close to the workload's (or `auto`) gives a more representative capacity. The
+banner shows the shape, repetitions and time used, e.g.
+`calibrated: DGEMM 975x284x398 (median training shape), 46 rep(s) in 0.25 s`.
+`auto` with very large training shapes runs at least one full DGEMM, which can
+take several seconds.
 
 **Demand per task.** This is the FLOP/s a task can usefully use, computed
 once per shape from its dimensions and operations:
@@ -203,8 +220,17 @@ line set the initial state, and a monitor thread on rank 0 keeps reading the
 *same* tokens from the control file (`sim_control.txt`, recreated empty on
 start; append with `>>`) and from stdin. That thread never calls MPI
 (`MPI_THREAD_FUNNELED`; `MULTIPLE` is requested in GPU modes because the CPU
-worker thread calls `MPI_Wtime`). Rank 0's main thread publishes the state into the RMA
-window, and every rank reads it with atomic RMA ops.
+worker thread calls `MPI_Wtime`). The banner prints the provided level by
+name, e.g. `MPI_THREAD_FUNNELED`, and adds the requested level if the library
+gave less. Rank 0's main thread publishes the state into the RMA window, and
+every rank reads it with atomic RMA ops.
+
+**`--max-seconds T`** ends the run with `e:1` (checkpoints saved) after T
+seconds of simulation. It is not a token sent through rank 0. Every rank
+starts its own clock right after a barrier at the start of the task loop, so
+setup, calibration and `--selftest` don't count. Each rank switches itself to
+`e:1` when T is reached, so a busy or suspended rank 0 cannot delay the
+others. Like `e:1`, it takes effect at each rank's next unit boundary.
 
 ## Workloads and shape selection
 
