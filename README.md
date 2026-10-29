@@ -58,7 +58,7 @@ mpirun -np 4 ./mpisim exec_mode:gpu --gpu-mult 250   # GPU = 250 x a CPU process
 mpirun -np 4 ./mpisim exec_mode:gpu --no-pack        # baseline: one task at a time per rank
 mpirun -np 4 ./mpisim "shape_mode=t:2,2,2;i:2" "shape_range=t:1024;i:256,4096"   # see Workloads
 mpirun -np 4 ./mpisim --max-seconds 100 "shape_mode=t:2,2,2;i:2" "shape_range=t:32;i:8,32" --no-ckpt # disable
-checkpoints and run for fixed #seconds
+checkpoints and run for fixed secs
 ```
 
 The `EMU=1` build calls BLAS from the emulated device thread and the CPU worker
