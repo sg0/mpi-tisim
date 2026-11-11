@@ -1,4 +1,4 @@
-# mpi-tisim — MPI training/inference workload simulator
+# mpisim — MPI training/inference workload simulator
 
 C++17 + MPI-3 simulator. Every rank runs an infinite self-scheduling loop that
 pulls tasks from a global counter (NXTVAL) and runs either a **training** task
@@ -57,8 +57,6 @@ mpirun -np 4 ./mpisim exec_mode:cpu,gpu --selftest   # route by task FLOPs, veri
 mpirun -np 4 ./mpisim exec_mode:gpu --gpu-mult 250   # GPU = 250 x a CPU process
 mpirun -np 4 ./mpisim exec_mode:gpu --no-pack        # baseline: one task at a time per rank
 mpirun -np 4 ./mpisim "shape_mode=t:2,2,2;i:2" "shape_range=t:1024;i:256,4096"   # see Workloads
-mpirun -np 4 ./mpisim --max-seconds 100 "shape_mode=t:2,2,2;i:2" "shape_range=t:32;i:8,32" --no-ckpt # disable
-checkpoints and run for fixed secs
 ```
 
 The `EMU=1` build calls BLAS from the emulated device thread and the CPU worker
@@ -68,6 +66,91 @@ call OpenBLAS from one thread per rank.
 `exec_mode` is a startup argument. All of these forms work: `exec_mode:cpu,gpu`,
 `exec_mode: cpu,gpu`, `exec_mode=gpu` and `--exec-mode cpu`. Live control
 (below) works exactly as before.
+
+## Command-line reference
+
+All options are optional; defaults are in parentheses. `./mpisim --help`
+prints the same list. Arguments containing `;` must be quoted in a shell.
+
+**Control tokens.** These can be given at startup, and sent live while the
+run is going: append them to the control file (`./simctl.sh TOKEN`) or type
+them on `mpirun`'s stdin.
+
+| token | meaning |
+|---|---|
+| `p:<0..1>` | probability of choosing an inference task (0.5); raising it checkpoints running training tasks |
+| `s:<rank\|all>` | suspend rank(s): checkpoint running work, stop taking tasks |
+| `r:<rank\|all>` | resume rank(s): drain checkpoints and claims before new tasks |
+| `e:1` / `e:0` | exit, saving checkpoints / without saving |
+| `l:<pct>,<lo>-<hi>` | a random `pct`% of ranks use a NXTVAL incr drawn from [lo, hi] per claim; `l:off` resets all to 1 |
+
+**Execution mode**
+
+| option | meaning |
+|---|---|
+| `exec_mode:cpu\|gpu\|cpu,gpu` | where tasks run (cpu); `cpu,gpu` routes by task FLOPs |
+| `--gpu-threshold F` | `cpu,gpu`: tasks above F FLOPs go to the GPU (1e12) |
+
+**Shapes and workload**
+
+| option | meaning |
+|---|---|
+| `shape_range=t:lo-hi;i:b,l` | dimension ranges; inference `b` = batch range, `l` = layer-width range (or one `i:lo-hi`); `hi` alone → lo = ceil(hi/16) |
+| `shape_mode=t:b,n,k;i:k` | dimensions as powers of a base (≥ 2), `*` = any integer; inference takes one base |
+| `--nshapes N` | shapes per task type; fewer if the combinations run out (100) |
+| `--min-dim N` / `--max-dim N` | default dimension range when `shape_range` is not given (256 / 4096, max 8192) |
+| `--max-layers N` | inference layers in [2, N], N ≤ 16 (8) |
+| `--epochs N` | training epochs per task (40) |
+| `--seed S` | seed for shapes and task data |
+| `--print-shapes` | print both shape tables with task FLOPs, then exit |
+
+**Scheduling**
+
+| option | meaning |
+|---|---|
+| `--nxtval-rank R` | rank hosting the NXTVAL counter / control RMA window (0) |
+| `--sync-every N` | task decisions between syncs of the global train/infer mix (8) |
+| `--poll-ms X` | control poll interval inside kernels (0.5) |
+
+**Checkpoints and control files**
+
+| option | meaning |
+|---|---|
+| `--ckpt-dir DIR` | checkpoint directory (`checkpoints`) |
+| `--fresh` | discard checkpoints left by a previous run |
+| `--no-ckpt` | write and load no checkpoint files; interrupted work stays in memory, `e:1` saves nothing |
+| `--ctl FILE` | control file (`sim_control.txt`), recreated empty at start |
+| `--no-stdin` | don't read control tokens from stdin |
+
+**GPU capacity and packing** (exec_mode `gpu` / `cpu,gpu`)
+
+| option | meaning |
+|---|---|
+| `--cpu-gflops X` | CPU GFLOP/s per process; skips calibration (0 = calibrate) |
+| `--calib-dgemm D` | calibration DGEMM: `N`, `MxNxK`, or `auto` = median training shape (384) |
+| `--calib-secs S` | repeat the calibration DGEMM for at least S seconds (0.25) |
+| `--gpu-mult X` | GPU GFLOP/s = X × CPU GFLOP/s per process (100) |
+| `--gpu-gflops X` | absolute GPU GFLOP/s per device; overrides `--gpu-mult` |
+| `--gpu-streams N` | max concurrent streams per device, shared by its ranks (16) |
+| `--no-pack` | one task at a time per rank (baseline) |
+| `--no-spill` | `cpu,gpu`: CPU-routed tasks never use spare GPU capacity |
+| `--no-rebalance` | `cpu,gpu`: an idle CPU never takes a waiting GPU-routed task |
+| `--gpu-depth N` | units in flight per GPU job (2, max 4) |
+| `--gpu-tile N` | DGEMM tile edge in the occupancy model (64) |
+| `--ctas-per-sm N` | concurrent GEMM tiles per SM in the model (2) |
+| `--launch-us X` | kernel launch cost in the demand model (5) |
+| `--unit-ms X` | target duration of one inference GPU unit (20) |
+| `--max-wait-ms X` | age of a blocked GPU task that stops backfilling (200) |
+
+**Run length, diagnostics and output**
+
+| option | meaning |
+|---|---|
+| `--max-seconds T` | exit with `e:1` after T seconds of task loop, measured on every rank (0 = never) |
+| `--selftest` | verify checkpoint/resume and CPU↔GPU agreement before running |
+| `--timeline FILE` | per-rank timeline CSV (`sim_timeline.csv`) |
+| `--timeline-ms X` | timeline sample interval (250) |
+| `--quiet` / `--verbose` | less / more logging |
 
 ## CPU / GPU execution
 
@@ -317,11 +400,16 @@ checkpointed and resumed task matches an uninterrupted one bit for bit.
 
 ## Scheduling
 
-* **RMA window on rank 0** (`MPI_Win_allocate`, `MPI_Win_lock_all`), all `int64`:
-  `[NXTVAL, global train starts, global infer starts, ctl version, priority, exit, suspend[np]]`.
-* **NXTVAL** = `MPI_Fetch_and_op(+1, MPI_SUM)` + flush. Each new task gets the
-  next global id; the id picks the shape and data. Ranks pull work when they
-  are free, so faster or less loaded ranks take more tasks.
+* **RMA window** on rank 0 by default, or on any rank with
+  `--nxtval-rank R` (`MPI_Win_allocate`, `MPI_Win_lock_all`), all `int64`:
+  `[NXTVAL, global train starts, global infer starts, ctl version, priority, exit, suspend[np], incr lo[np], incr hi[np]]`.
+  Every rank, the host included, reaches it with passive-target RMA. Control
+  tokens are still read by rank 0's monitor thread and written into the
+  window by rank 0, wherever the window lives.
+* **NXTVAL** = `MPI_Fetch_and_op(+incr, MPI_SUM)` + flush, used by the
+  `count`/`next` loop below. The claimed index is the task id, which picks
+  the shape and data. Ranks pull work when they are free, so faster or less
+  loaded ranks take more tasks.
 * **Equitable mix:** the task type is a biased coin
   `p_eff = p + ½(p − f_global) + ½(p − f_local)`. Here `f_local` is this rank's
   inference fraction, and `f_global` is synced from the window counters every
@@ -426,7 +514,8 @@ means *all* running tasks of the rank: every GPU job and the CPU worker.
   instead of taking a new NXTVAL id.
 * **`s:R`:** rank R checkpoints its in-flight task (training or inference)
   plus any queued checkpoints to `checkpoints/rank_R.ckpt`, then idles.
-  Suspending rank 0 is fine: it keeps polling, so it keeps serving the window.
+  Suspending rank 0 or the window's host rank is fine: a suspended rank keeps
+  polling, so it keeps publishing control and serving the window.
 * **`r:R`:** the rank reloads its file and drains every checkpoint before it
   calls NXTVAL again. With packing, checkpoints are drained concurrently, and
   no new task is taken until all of them have *completed*.
@@ -505,5 +594,6 @@ to `sim_timeline.csv` for plotting.
 
 Notes: OpenBLAS is pinned to 1 thread per rank. When there are more ranks than
 cores, busy% is wall time spent inside kernels, so lower GFLOP/s there reflects
-time-sharing rather than idleness. Passive-target progress relies on rank 0
-entering MPI between kernels, which it does every ≤0.5 ms.
+time-sharing rather than idleness. Passive-target progress relies on the
+window's host rank (`--nxtval-rank`) entering MPI between kernels, which it
+does every ≤0.5 ms.

@@ -103,6 +103,7 @@ struct Config {
   std::string timeline_file = "sim_timeline.csv";
   bool fresh = false;          // ignore / delete checkpoints from a previous run
   bool ckpt = true;            // --no-ckpt: no checkpoint files (partial work stays in memory)
+  int nxtval_rank = 0;         // --nxtval-rank: rank hosting the NXTVAL / control RMA window
   bool use_stdin = true;
   bool selftest = false;
   int sync_every = 8;          // decisions between global-mix syncs
@@ -426,13 +427,18 @@ static std::vector<Sample> g_timeline;
 static double g_next_sample = 0.0;
 
 // ----------------------------------------------------------------------------
-// RMA window: global counters + published control state (lives on rank 0)
+// RMA window: global counters (NXTVAL, train/infer mix) + published control
+// state. It lives on rank g_host (--nxtval-rank, default 0); every rank,
+// including the host itself, accesses it with passive-target RMA. Control
+// tokens are still read by rank 0's monitor thread and written into the
+// window by rank 0's main thread, wherever the window lives.
 // ----------------------------------------------------------------------------
 // control block at W_PRIO: [prio, exit, susp[np], claim_lo[np], claim_hi[np]]
 enum { W_NXT = 0, W_GTRAIN = 1, W_GINF = 2, W_VER = 3, W_PRIO = 4, W_EXIT = 5, W_SUSP0 = 6 };
 static int ctl_len() { return 2 + 3 * g_np; }
 static MPI_Win g_win;
 static int64_t* g_winbuf = nullptr;
+static int g_host = 0;  // rank that hosts the window
 static constexpr double PRIO_SCALE = 1e9;
 
 // Local view of the control state (every rank)
@@ -469,14 +475,14 @@ static std::atomic<bool> monitor_stop{false};
 
 static int64_t rma_fetch_add(int disp, int64_t inc) {
   int64_t res = 0;
-  MPI_Fetch_and_op(&inc, &res, MPI_INT64_T, 0, disp, MPI_SUM, g_win);
-  MPI_Win_flush(0, g_win);
+  MPI_Fetch_and_op(&inc, &res, MPI_INT64_T, g_host, disp, MPI_SUM, g_win);
+  MPI_Win_flush(g_host, g_win);
   return res;
 }
 static int64_t rma_read(int disp) {
   int64_t res = 0;
-  MPI_Fetch_and_op(nullptr, &res, MPI_INT64_T, 0, disp, MPI_NO_OP, g_win);
-  MPI_Win_flush(0, g_win);
+  MPI_Fetch_and_op(nullptr, &res, MPI_INT64_T, g_host, disp, MPI_NO_OP, g_win);
+  MPI_Win_flush(g_host, g_win);
   return res;
 }
 
@@ -774,11 +780,12 @@ static void publish_if_needed() {
     }
   }
   int n = ctl_len();
-  MPI_Accumulate(vals.data(), n, MPI_INT64_T, 0, W_PRIO, n, MPI_INT64_T, MPI_REPLACE, g_win);
-  MPI_Win_flush(0, g_win);
+  MPI_Accumulate(vals.data(), n, MPI_INT64_T, g_host, W_PRIO, n, MPI_INT64_T, MPI_REPLACE,
+                 g_win);
+  MPI_Win_flush(g_host, g_win);
   int64_t vv = (int64_t)v;
-  MPI_Accumulate(&vv, 1, MPI_INT64_T, 0, W_VER, 1, MPI_INT64_T, MPI_REPLACE, g_win);
-  MPI_Win_flush(0, g_win);
+  MPI_Accumulate(&vv, 1, MPI_INT64_T, g_host, W_VER, 1, MPI_INT64_T, MPI_REPLACE, g_win);
+  MPI_Win_flush(g_host, g_win);
   published_ver = v;
 }
 
@@ -791,9 +798,9 @@ static void poll_control() {
   if (ver != seen_ver) {
     int n = ctl_len();
     std::vector<int64_t> blk(n);
-    MPI_Get_accumulate(nullptr, 0, MPI_INT64_T, blk.data(), n, MPI_INT64_T, 0, W_PRIO, n,
+    MPI_Get_accumulate(nullptr, 0, MPI_INT64_T, blk.data(), n, MPI_INT64_T, g_host, W_PRIO, n,
                        MPI_INT64_T, MPI_NO_OP, g_win);
-    MPI_Win_flush(0, g_win);
+    MPI_Win_flush(g_host, g_win);
     double np_ = blk[0] / PRIO_SCALE;
     if (seen_ver >= 0) {
       st.ctl_changes++;
@@ -1711,9 +1718,9 @@ static void run_loop() {
         task.id = id;
         task.shape = pick_shape(type, task.id);
         const int64_t one = 1;
-        MPI_Accumulate(&one, 1, MPI_INT64_T, 0,
+        MPI_Accumulate(&one, 1, MPI_INT64_T, g_host,
                        type == TRAIN ? W_GTRAIN : W_GINF, 1, MPI_INT64_T, MPI_SUM, g_win);
-        MPI_Win_flush(0, g_win);
+        MPI_Win_flush(g_host, g_win);
         (type == TRAIN ? st.train_new : st.infer_new) += 1;
         if (++since_sync >= cfg.sync_every) {
           since_sync = 0;
@@ -2258,9 +2265,9 @@ static void run_loop_concurrent() {
           x.task.id = id;
           x.task.shape = pick_shape(type, x.task.id);
           const int64_t one = 1;
-          MPI_Accumulate(&one, 1, MPI_INT64_T, 0, type == TRAIN ? W_GTRAIN : W_GINF, 1,
+          MPI_Accumulate(&one, 1, MPI_INT64_T, g_host, type == TRAIN ? W_GTRAIN : W_GINF, 1,
                          MPI_INT64_T, MPI_SUM, g_win);
-          MPI_Win_flush(0, g_win);
+          MPI_Win_flush(g_host, g_win);
           (type == TRAIN ? st.train_new : st.infer_new) += 1;
           if (++since_sync >= cfg.sync_every) {
             since_sync = 0;
@@ -2379,9 +2386,9 @@ static void report(const std::vector<double>& all, const std::vector<int>& tcoun
               G(T.exec_train + T.exec_infer) / std::max(tb, 1e-12));
 
   std::printf("\n Scheduling\n");
-  std::printf("   NXTVAL final value = %lld  (new tasks handed out; %lld train / %lld infer -> "
-              "infer fraction %.3f)\n", (long long)nxt, (long long)gtr, (long long)gin,
-              (gtr + gin) ? (double)gin / (gtr + gin) : 0.0);
+  std::printf("   NXTVAL final value = %lld on rank %d (sum of incr over all claims); new tasks: "
+              "%lld train / %lld infer -> infer fraction %.3f\n", (long long)nxt, g_host,
+              (long long)gtr, (long long)gin, (gtr + gin) ? (double)gin / (gtr + gin) : 0.0);
   std::printf("   total simulation loops = %.0f (%.0f task runs, %.0f idle/suspended loops)\n",
               T.loops, T.task_runs, T.idle_loops);
   std::printf("   control polls = %.0f, control changes seen = %.0f (per rank avg), global-mix "
@@ -2486,7 +2493,7 @@ static void report(const std::vector<double>& all, const std::vector<int>& tcoun
   {
     bool any_incr = false;
     for (auto& s : S) any_incr = any_incr || s.max_block > 1 || s.claim_hi > 1;
-    std::printf("\n NXTVAL task loop  (count/next walk; %s)\n",
+    std::printf("\n NXTVAL task loop  (count/next walk; counter on rank %d; %s)\n", g_host,
                 any_incr ? "some ranks used incr > 1 via l:" : "every rank used incr = 1");
     std::printf(" rank | incr now | claims | sum incr | incr mean  max | wait iters | gap mean | "
                 "claim->start ms mean / max | waiting %% | unstarted | done GFLOP\n");
@@ -2660,6 +2667,7 @@ static void usage() {
       "  --ckpt-dir DIR    checkpoint directory                (checkpoints)\n"
       "  --timeline FILE   per-rank timeline CSV               (sim_timeline.csv)\n"
       "  --fresh           discard checkpoints left by a previous run\n"
+      "  --nxtval-rank R   rank that hosts the NXTVAL counter / control RMA window (0)\n"
       "  --no-ckpt         write no checkpoint files and load none; preempted / suspended\n"
       "                    work stays in memory; e:1 then exits like e:0 (nothing saved)\n"
       "  --no-stdin        do not read control tokens from stdin\n"
@@ -2896,6 +2904,17 @@ static bool parse_args(int argc, char** argv) {
     else if (a == "--timeline") cfg.timeline_file = next("--timeline");
     else if (a == "--fresh") cfg.fresh = true;
     else if (a == "--no-ckpt") cfg.ckpt = false;
+    else if (a == "--nxtval-rank") {
+      long r = -1;
+      std::string v = next("--nxtval-rank");
+      if (!parse_int(v, &r) || r < 0 || r >= g_np) {
+        if (g_rank == 0)
+          std::fprintf(stderr, "--nxtval-rank: bad rank '%s' (need 0..%d for %d process(es))\n",
+                       v.c_str(), g_np - 1, g_np);
+        return false;
+      }
+      cfg.nxtval_rank = (int)r;
+    }
     else if (a == "--no-stdin") cfg.use_stdin = false;
     else if (a == "--sync-every") cfg.sync_every = std::max(1, std::stoi(next("--sync-every")));
     else if (a == "--poll-ms") cfg.poll_ms = std::stod(next("--poll-ms"));
@@ -3048,9 +3067,10 @@ int main(int argc, char** argv) {
 
   // RMA window: counters + control block on rank 0
   const int nwin = W_PRIO + ctl_len();
-  MPI_Win_allocate(g_rank == 0 ? nwin * sizeof(int64_t) : 0, sizeof(int64_t), MPI_INFO_NULL,
+  g_host = cfg.nxtval_rank;
+  MPI_Win_allocate(g_rank == g_host ? nwin * sizeof(int64_t) : 0, sizeof(int64_t), MPI_INFO_NULL,
                    MPI_COMM_WORLD, &g_winbuf, &g_win);
-  if (g_rank == 0) std::fill(g_winbuf, g_winbuf + nwin, 0);
+  if (g_rank == g_host) std::fill(g_winbuf, g_winbuf + nwin, 0);
   MPI_Barrier(MPI_COMM_WORLD);
   MPI_Win_lock_all(MPI_MODE_NOCHECK, g_win);
 
@@ -3083,6 +3103,8 @@ int main(int argc, char** argv) {
     std::printf("        avg task size: train %.4g GFLOP, infer %.4g GFLOP; control file: %s%s\n",
                 tf / nshape(TRAIN) * 1e-9, inf / nshape(INFER) * 1e-9, cfg.ctl_file.c_str(),
                 cfg.use_stdin ? " (+ stdin)" : "");
+    std::printf("        NXTVAL / control RMA window on rank %d%s\n", g_host,
+                g_host == 0 ? "" : " (control tokens still read and published by rank 0)");
     std::printf("        checkpoints: %s\n",
                 cfg.ckpt ? (cfg.ckpt_dir + "/rank_<r>.ckpt").c_str()
                          : "disabled (--no-ckpt): nothing written or loaded; preempted / "
