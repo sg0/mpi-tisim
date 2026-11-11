@@ -1,4 +1,4 @@
-# mpisim — MPI training/inference workload simulator
+# mpi-tisim — MPI training/inference workload simulator
 
 C++17 + MPI-3 simulator. Every rank runs an infinite self-scheduling loop that
 pulls tasks from a global counter (NXTVAL) and runs either a **training** task
